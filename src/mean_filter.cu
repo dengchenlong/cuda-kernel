@@ -1,4 +1,4 @@
-// 均值滤波：分离滑动窗口，O(1)/像素（与核尺寸无关），总访存 ~6B/像素
+﻿// 均值滤波：分离滑动窗口，O(1)/像素（与核尺寸无关），总访存 ~6B/像素
 // 行遍：u8 -> u16 行和（reflect101 边界在取数时镜像）；列遍：u16 -> u8 归一化
 // 边界语义与 cv::cuda::boxFilter 默认 BORDER_DEFAULT(=REFLECT_101) 一致
 #include "ops.h"
@@ -8,6 +8,7 @@ namespace {
 
 constexpr int MF_THREADS = 256;
 constexpr int MAX_MK = 255;
+constexpr int MF_PAD = 512;   // smem 扫描宽度 = MF_THREADS + MAX_MK - 1 向上取 2 的幂
 
 template <bool IS_ROW>
 __device__ __forceinline__ int mirror101(int i, int len)
@@ -17,33 +18,44 @@ __device__ __forceinline__ int mirror101(int i, int len)
     return max(0, min(len - 1, i));
 }
 
-// 行遍：每 block 处理一行的一个 256 像素段，线程内沿 tile 步进做滑动和
+// 行遍：每 block 处理一行的一个 256 像素段。用 smem 前缀和求窗口和 —— O(1)/像素且与核尺寸无关。
+// （注意：不能按线程做"步进 256 的滑动更新"，窗口每步移动 256 像素却只加/减 1 个元素是错的。）
 __global__ void mean_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                  uint16_t* __restrict__ tmp, size_t tstep,   // tstep 字节
                                  int W, int k)
 {
-    const int y = blockIdx.y;
-    const int x0 = blockIdx.x * MF_THREADS;
+    __shared__ uint32_t sp[MF_PAD];
+    const int y   = blockIdx.y;
+    const int x0  = blockIdx.x * MF_THREADS;
     const int half = k >> 1;
     const int tid = threadIdx.x;
+    const int N   = MF_THREADS + k - 1;              // tile 宽度（含两侧窗口延伸）
     const uint8_t* srow = src + (size_t)y * sstep;
 
-    auto fetch = [=](int x) -> uint32_t {
-        return srow[mirror101<true>(x, W)];
-    };
+    // 加载 tile（带 reflect101 边界），超出 N 的 padding 填 0
+    for (int i = tid; i < N; i += MF_THREADS)
+        sp[i] = srow[mirror101<true>(x0 - half + i, W)];
+    for (int i = N + tid; i < MF_PAD; i += MF_THREADS) sp[i] = 0;
+    __syncthreads();
+
+    // Hillis-Steele inclusive scan：MF_PAD 个元素，每线程负责相邻 2 个
+#pragma unroll
+    for (int d = 1; d < MF_PAD; d <<= 1) {
+        const int i0 = 2 * tid, i1 = 2 * tid + 1;
+        uint32_t a = 0, b = 0;
+        if (i0 >= d) a = sp[i0 - d];
+        if (i1 >= d) b = sp[i1 - d];
+        __syncthreads();
+        if (i0 >= d) sp[i0] += a;
+        if (i1 >= d) sp[i1] += b;
+        __syncthreads();
+    }
 
     const int x = x0 + tid;
-    if (x >= W) return;
-
-    // 初始窗口和
-    uint32_t sum = 0;
-    for (int j = 0; j < k; ++j) sum += fetch(x - half + j);
-    tmp[(size_t)y * (tstep >> 1) + x] = (uint16_t)sum;
-
-    // 同一线程沿 x 方向按 block 宽度步进：滑动更新
-    for (int xx = x + MF_THREADS; xx < W; xx += MF_THREADS) {
-        sum += fetch(xx + half) - fetch(xx - half - 1);
-        tmp[(size_t)y * (tstep >> 1) + xx] = (uint16_t)sum;
+    if (x < W) {
+        // 窗口 [x-half, x+half] = tile 索引 [tid, tid+k-1]
+        const uint32_t sum = sp[tid + k - 1] - (tid > 0 ? sp[tid - 1] : 0);
+        tmp[(size_t)y * (tstep >> 1) + x] = (uint16_t)sum;
     }
 }
 

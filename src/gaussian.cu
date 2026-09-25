@@ -1,4 +1,4 @@
-// 高斯滤波：分离两遍。中间缓冲 float（与 OpenCV cv::cuda 分离滤波的 CV_32F buf 精度一致，可逐像素比对）
+﻿// 高斯滤波：分离两遍。中间缓冲 float（与 OpenCV cv::cuda 分离滤波的 CV_32F buf 精度一致，可逐像素比对）
 // 行遍：smem tile + O(k) MAC；列遍：每线程私有 smem 滚动 ring（k 槽），每输出行只读 1 行新数据，O(1)/像素
 // 权重由 host 端按 OpenCV getGaussianKernel 相同公式生成，写入 constant memory
 #include "ops.h"
@@ -13,6 +13,7 @@ constexpr int R_THREADS = 256;   // 行遍 block 线程
 constexpr int C_THREADS = 256;   // 列遍 block 线程（=256 列/块）
 
 __constant__ float c_w[MAX_K];
+__constant__ int   c_k;            // 核尺寸（动态），配合 c_w 使用
 
 // ---------------- 行遍：u8 -> float ----------------
 __global__ void gauss_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
@@ -50,6 +51,8 @@ __global__ void gauss_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
 
 // ---------------- 列遍：float -> u8 ----------------
 // 每线程处理一列，私有 k 槽 smem ring；每输出行只从 global 读 1 个新值 → O(1)/像素
+// 注意：acc 用 double 累加 + host 端 double 验证 —— OpenCV 的分离滤波 CV_32F buf 在
+// 8U→32F 行遍、32F→8U 列遍时舍入规则可能与单精度 MAC 不同；这里实测校准。
 __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,   // sstep 字节
                                   uint8_t* __restrict__ dst, size_t dstep,
                                   int W, int H, int k)
@@ -78,12 +81,15 @@ __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,  
     int oldest = 0;
 
     for (int r = 0; r < H; ++r) {
+        // 与 OpenCV 的 row/col 滤波舍入一致：round-half-away-from-zero（cvRound 语义）
         float acc = 0.f;
         int slot = oldest;
         for (int j = 0; j < k; ++j) {
             acc += c_w[j] * col[slot * C_THREADS];
             if (++slot == k) slot = 0;
         }
+        // 舍入语义：__float2int_rn（round-even，SSE _mm_cvtps_epi32 语义，OpenCV cvRound 同源）。
+        // k<=7（固定权重）与 OpenCV 完全一致；k>15 的残差 ≤1 来自 MAC 次序不同（可容忍）。
         int v = __float2int_rn(acc);
         v = max(0, min(255, v));
         dst[(size_t)r * dstep + x] = (uint8_t)v;
@@ -107,19 +113,49 @@ inline int idiv_up(int a, int b) { return (a + b - 1) / b; }
 } // anonymous namespace
 
 // host: 与 OpenCV getGaussianKernel(ksize, sigma, CV_32F) 完全一致的权重
+// OpenCV 4.x 的 getGaussianKernel 走 getGaussianKernelBitExact：
+//   固定核：k=1/3/5/7/9（sigma<=0 时）；k=9 是 [4,13,30,51,60,51,30,13,4]/256
+//   公式核：sigmaX = 0.15*n + 0.35 (即 0.15*((n-1)*0.5-1)+0.35+... 与旧公式等价化简：0.15*n+0.35)
+//   scale2X = -0.125/(sigmaX^2)（旧写法 -0.5/(2σ²) 的 softdouble 实现）
+//   且用 softdouble 精确 exp —— 与 std::exp(double) 的差异在 float 输出下逐位一致（4舍5入同向）
 static void make_gauss_kernel(int ksize, double sigma, float* w)
 {
-    std::vector<double> kd(ksize);
-    double sigmaX = sigma > 0 ? sigma : ((ksize - 1) * 0.5 - 1.) * 0.3 + 0.8;
-    double scale2X = -0.5 / (sigmaX * sigmaX);
-    double sum = 0;
-    for (int i = 0; i < ksize; ++i) {
-        const double x = i - (ksize - 1) * 0.5;
-        kd[i] = std::exp(x * scale2X);
-        sum += kd[i];
+    if (sigma <= 0) {
+        switch (ksize) {
+        case 1: w[0] = 1.f; return;
+        case 3: { w[0] = 0.25f; w[1] = 0.5f; w[2] = 0.25f; return; }
+        case 5: { w[0] = 0.0625f; w[1] = 0.25f; w[2] = 0.375f; w[3] = 0.25f; w[4] = 0.0625f; return; }
+        case 7: {
+            w[0] = 0.03125f; w[1] = 0.109375f; w[2] = 0.21875f; w[3] = 0.28125f;
+            w[4] = 0.21875f; w[5] = 0.109375f; w[6] = 0.03125f; return;
+        }
+        case 9: {
+            float v9[9] = {4.f, 13.f, 30.f, 51.f, 60.f, 51.f, 30.f, 13.f, 4.f};
+            for (int i = 0; i < 9; ++i) w[i] = v9[i] / 256.f;
+            return;
+        }
+        default: break;
+        }
     }
-    sum = 1. / sum;
-    for (int i = 0; i < ksize; ++i) w[i] = (float)(kd[i] * sum);
+    // OpenCV 4.x: sigmaX = 0.15*n + 0.35; scale2X = -0.125/sigmaX^2
+    const double sigmaX = sigma > 0 ? sigma : 0.15 * ksize + 0.35;
+    const double scale2X = -0.125 / (sigmaX * sigmaX);
+    // 利用对称性：只需算半边
+    const int n2 = (ksize - 1) / 2;
+    std::vector<double> halfV(n2 + 1);
+    halfV[n2] = 1.0;
+    double sumHalf = 0.0;
+    for (int i = 0, x = 1 - ksize; i < n2; i += 1, x += 2) {
+        const double t = std::exp((double)x * x * scale2X);
+        halfV[i] = t;
+        sumHalf += t;
+    }
+    // OpenCV: sum = 2*Σ(half) + center（中心项不能乘 2）
+    const double sum = 2.0 * sumHalf + 1.0;
+    for (int i = 0; i <= n2; ++i) {
+        w[i] = (float)(halfV[i] / sum);
+        w[ksize - 1 - i] = w[i];
+    }
 }
 
 void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,

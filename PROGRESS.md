@@ -40,9 +40,9 @@ G:\cuda-kernel
 
 ## 阶段
 1. [进行中] 环境搭建：装 VS2022BT → 编 OpenCV-CUDA (D:\opencv-cuda-build)
-2. [ ] 逐算子实现+正确性验证（vs OpenCV 结果逐像素比对）
-3. [ ] benchmark 框架：cudaEvents 计时，多分辨率 {640x480, 1280x720, 1920x1080, 3840x2160}，二值图/灰度图/自然图，预热+多次重复取中位
-4. [ ] 逐算子疯狂优化直到稳定 ≥ OpenCV（记录每次优化前后的数字进 BENCHMARK.md）
+2. [x] 逐算子实现+正确性验证（vs OpenCV 结果逐像素比对，smoke 全绿，mean ±1 舍入容差）
+3. [x] benchmark 框架：cudaEvents 计时，多分辨率 {640x480, 1280x720, 1920x1080, 3840x2160}，二值图/灰度图/自然图，预热+多次重复取中位
+4. [进行中] 逐算子疯狂优化直到稳定 ≥ OpenCV（记录每次优化前后的数字进 BENCHMARK.md）
 5. [ ] 收尾：README + BENCHMARK.md 数据齐全，全部算子达标
 
 ## 优化思路备忘
@@ -53,7 +53,21 @@ G:\cuda-kernel
 - 对比口径：都含 H2D 就绪后的纯 GPU 时间（cudaEvent 包住 kernel 或含拷贝分两栏报告，明确标注）
 
 ## 当前下一步（cron 续作从这里接）
-- 若 VS2022BT 未装完：等装完/重试安装
-- 然后配置+编译 OpenCV-CUDA（ninja，后台跑，约 30-60 分钟）
-- 编译期间开始写 src\ 下的算子代码
-- 注意：git 仓库不能破坏，只许 git add/commit，禁止 checkout/reset 丢工作
+- [x] 环境搭建完成：VS2022BT v143 (cl 19.44) 装在 D:\VS2022BuildTools；ninja 用 VS 内置
+- [x] 算子代码初版全部写完并 nvcc 编译通过（utf-8 BOM 必须，nvcc 加 -Xcompiler "/utf-8 /W3"）
+- [ ] OpenCV-CUDA 基准库编译中：后台脚本 D:\deps\build_opencv_cuda.bat → D:\opencv-cuda-build
+       （前两次失败原因：① 未加 WITH_CUDA=ON ② contrib cudev 缺失，已修正，含 contrib 路径 G:\opencv_contrib）
+       编完检查 D:\opencv-cuda-build\install\x64\vc17\bin\ 应有 opencv_cuda*.dll
+- [ ] 编译 smoke + benchmark（需要 OpenCV lib 就绪）：nvcc 命令参考 D:\deps\compile_gpuops.bat，
+       链接加 -L"D:/opencv-cuda-build/install/x64/vc17/lib" -lopencv_core4130 -lopencv_imgproc4130 -lopencv_cudaarithm4130 -lopencv_cudafilters4130 -lopencv_cudaimgproc4130 -lopencv_cudawarping4130，运行时 PATH 加 install\x64\vc17\bin
+- [x] 跑 smoke 修正确性：全部通过（integral/morph 全核全图 identical；gauss k=5/15 identical；hist identical；mean 残差 ≤1 舍入差异，smoke 容忍 md<=1）
+- [x] 跑 benchmark 记录首轮数字进 BENCHMARK.md（2026-09-26 全尺寸全算子，见 BENCHMARK.md 表格）
+- [ ] 逐算子优化（优化思路备忘见下）直到全面 WIN，每个数字都记进 BENCHMARK.md
+       首轮 WIN：integral 全尺寸、mean k>=15、morph k>=15、hist-binary、gauss k=15 大图。
+       首轮 LOSE 待修（按差距排序）：
+       1. hist-gray 0.22~0.85x —— 256-bin smem 原子冲突严重，改 warp 私有直方图（8KB smem，冲突降 32 倍）
+       2. morph k=3 0.11~0.19x —— van Herk 双趟对 k=3 开销大，加 k<=5 直接窗口快路径
+       3. mean k=3 0.34~0.43x —— 行遍扫描对小 k 换直加窗口
+       4. gaussian k=5/15 小图 0.33~0.92x —— 列遍每列一线程全场仅 W 线程，占用率过低，按行分块（每线程 H/C 行，块间预重叠 k-1 行）
+- 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
+- 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM

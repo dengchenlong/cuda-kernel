@@ -1,4 +1,4 @@
-// 积分图：两遍法
+﻿// 积分图：两遍法
 // Pass1: 行内前缀和 —— 每 warp 处理一行，uint4 向量化读入(每 lane 16B)，warp shuffle 扫描
 // Pass2: 列方向扫描 —— 分层：先扫 chunk，再用 carry 矩阵加前缀（对 W%4!=0 有标量回退路径）
 #include "ops.h"
@@ -19,6 +19,8 @@ __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sst
     const int lane  = threadIdx.x & 31;
     const int warp  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int nwarps = (gridDim.x * blockDim.x) >> 5;
+    const bool vecOK = ((sstep & 15) == 0) &&
+                       ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
 
     for (int y = warp; y < H; y += nwarps) {
         const uint8_t* srow = src + (size_t)y * sstep;
@@ -30,7 +32,6 @@ __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sst
             uint32_t vals[16];
             uint32_t partial = 0;
 
-            const bool vecOK = ((sstep & 15) == 0);
             if (my0 + 16 <= W && vecOK) {
                 // 快路径：对齐 uint4 读
                 union { uint4 v; uint8_t b[16]; } u;
@@ -82,8 +83,8 @@ __global__ void integral_cols_kernel(const uint32_t* __restrict__ in, size_t ist
     const int c0 = blockIdx.x * (blockDim.x * 4) + threadIdx.x * 4;
     if (c0 >= W) return;
 
-    const uint32_t* ip = (const uint32_t*)((const uint8_t*)in  + (size_t)r0 * istep) + c0;
-    uint32_t*       op = (uint32_t*)((uint8_t*)out + (size_t)r0 * ostep) + c0;
+    const uint4* ip = (const uint4*)((const uint8_t*)in  + (size_t)r0 * istep) + c0 / 4;
+    uint4*       op = (uint4*)((uint8_t*)out + (size_t)r0 * ostep) + c0 / 4;
 
     uint4 car = make_uint4(0, 0, 0, 0);
     for (int r = r0; r < r1; ++r) {
@@ -91,8 +92,8 @@ __global__ void integral_cols_kernel(const uint32_t* __restrict__ in, size_t ist
         v.x += car.x; v.y += car.y; v.z += car.z; v.w += car.w;
         *op = v;
         car = v;
-        ip = (const uint32_t*)((const uint8_t*)ip + istep);
-        op = (uint32_t*)((uint8_t*)op + ostep);
+        ip = (const uint4*)((const uint8_t*)ip + istep);
+        op = (uint4*)((uint8_t*)op + ostep);
     }
     if (nChunks > 1) {
         uint32_t* cr = carry + (size_t)chunk * W + c0;
@@ -117,12 +118,12 @@ __global__ void integral_carry_add_kernel(uint32_t* __restrict__ out, size_t ost
         exc.x += cr[0]; exc.y += cr[1]; exc.z += cr[2]; exc.w += cr[3];
     }
 
-    uint32_t* op = (uint32_t*)((uint8_t*)out + (size_t)r0 * ostep) + c0;
+    uint4* op = (uint4*)((uint8_t*)out + (size_t)r0 * ostep) + c0 / 4;
     for (int r = r0; r < r1; ++r) {
         uint4 v = *op;
         v.x += exc.x; v.y += exc.y; v.z += exc.z; v.w += exc.w;
         *op = v;
-        op = (uint32_t*)((uint8_t*)op + ostep);
+        op = (uint4*)((uint8_t*)op + ostep);
     }
 }
 
@@ -202,28 +203,41 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
 
     const int nChunks = idiv_up(height, CHUNK_H);
     const bool vecOK = ((dstStep & 15) == 0) && ((srcStep & 3) == 0) &&
-                       ((reinterpret_cast<uintptr_t>(d_dst) & 15) == 0);
+                       ((reinterpret_cast<uintptr_t>(d_dst) & 15) == 0) &&
+                       ((width & 3) == 0);
 
-    if (nChunks == 1) return;  // 列方向无需 carry
-
-    uint32_t* carry = (uint32_t*)ws_grow((size_t)nChunks * width * sizeof(uint32_t));
-    CUDA_CHECK(cudaMemsetAsync(carry, 0, 0, stream));  // no-op 占位，保持依赖清晰
+    uint32_t* carry = nullptr;
+    if (nChunks > 1)
+        carry = (uint32_t*)ws_grow((size_t)nChunks * width * sizeof(uint32_t));
 
     if (vecOK) {
         const int colBlocks = idiv_up(width, CT_THREADS * 4);
-        dim3 g(colBlocks, nChunks), t(CT_THREADS);
-        integral_cols_kernel<<<g, t, 0, stream>>>(
-            d_dst, dstStep, d_dst, dstStep, carry, width, height, nChunks);
-        dim3 g2(colBlocks, nChunks - 1);
-        integral_carry_add_kernel<<<g2, t, 0, stream>>>(
-            d_dst, dstStep, carry, width, height);
+        if (nChunks == 1) {
+            // 单 chunk：无需 carry 矩阵，但仍必须做列方向扫描（此前此处提前 return 是 bug）
+            dim3 g(colBlocks), t(CT_THREADS);
+            integral_cols_kernel<<<g, t, 0, stream>>>(
+                d_dst, dstStep, d_dst, dstStep, nullptr, width, height, 1);
+        } else {
+            dim3 g(colBlocks, nChunks), t(CT_THREADS);
+            integral_cols_kernel<<<g, t, 0, stream>>>(
+                d_dst, dstStep, d_dst, dstStep, carry, width, height, nChunks);
+            dim3 g2(colBlocks, nChunks - 1);
+            integral_carry_add_kernel<<<g2, t, 0, stream>>>(
+                d_dst, dstStep, carry, width, height);
+        }
     } else {
         const int colBlocks = idiv_up(width, 256);
-        dim3 g(colBlocks, nChunks), t(256);
-        integral_cols_scalar_kernel<<<g, t, 0, stream>>>(
-            d_dst, dstStep, d_dst, dstStep, carry, width, height, nChunks);
-        dim3 g2(colBlocks, nChunks - 1);
-        integral_carry_add_scalar_kernel<<<g2, t, 0, stream>>>(
-            d_dst, dstStep, carry, width, height);
+        if (nChunks == 1) {
+            dim3 g(colBlocks), t(256);
+            integral_cols_scalar_kernel<<<g, t, 0, stream>>>(
+                d_dst, dstStep, d_dst, dstStep, nullptr, width, height, 1);
+        } else {
+            dim3 g(colBlocks, nChunks), t(256);
+            integral_cols_scalar_kernel<<<g, t, 0, stream>>>(
+                d_dst, dstStep, d_dst, dstStep, carry, width, height, nChunks);
+            dim3 g2(colBlocks, nChunks - 1);
+            integral_carry_add_scalar_kernel<<<g2, t, 0, stream>>>(
+                d_dst, dstStep, carry, width, height);
+        }
     }
 }

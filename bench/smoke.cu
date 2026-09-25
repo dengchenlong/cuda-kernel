@@ -1,4 +1,4 @@
-// 冒烟测试：小尺寸 + 边角尺寸，逐算子与 OpenCV-CUDA 结果比对
+﻿// 冒烟测试：小尺寸 + 边角尺寸，逐算子与 OpenCV-CUDA 结果比对
 #include <opencv2/core.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/cudaarithm.hpp>
@@ -26,7 +26,7 @@ static int maxDiff(const cv::Mat& a, const cv::Mat& b, const char* what)
     for (int y = 0; y < a.rows; ++y) {
         const uchar* pa = a.ptr(y);
         const uchar* pb = b.ptr(y);
-        for (size_t x = 0; x < a.total() * a.elemSize(); ++x)
+        for (size_t x = 0; x < (size_t)a.cols * a.elemSize(); ++x)
             md = std::max(md, std::abs((int)pa[x] - (int)pb[x]));
     }
     if (md > 0) { printf("  [WARN] %s: max diff = %d\n", what, md); }
@@ -47,6 +47,7 @@ static cv::Mat randU8(int w, int h, bool binary, unsigned seed)
 
 int main()
 {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     CUDA_CHECK(cudaFree(0));
     struct Case { int w, h; };
     const Case cases[] = {{65, 49}, {128, 128}, {640, 480}, {321, 200}};
@@ -70,8 +71,9 @@ int main()
             CUDA_CHECK(cudaMalloc(&dMine, mstep * H));
             gpu_integral(dGray.data, dGray.step, dMine, mstep, W, H);
             cv::Mat mine(H, W, CV_32SC1);
-            CUDA_CHECK(cudaMemcpy2D(mine.data, mstep, dMine, mstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
-            maxDiff(mine, ref, "integral");
+            CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
+            // OpenCV 的 integral 输出是 (W+1)x(H+1)，左上多一行一列 0；取子矩形比对
+            maxDiff(mine, ref(cv::Rect(1, 1, W, H)), "integral");
             cudaFree(dMine);
         }
 
@@ -85,7 +87,7 @@ int main()
             CUDA_CHECK(cudaMallocPitch(&dMine, &mstep, W, H));
             gpu_mean(dGray.data, dGray.step, dMine, mstep, W, H, k, k);
             cv::Mat mine(H, W, CV_8UC1);
-            CUDA_CHECK(cudaMemcpy2D(mine.data, W, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
             char name[32]; snprintf(name, 32, "mean k=%d", k);
             maxDiff(mine, ref, name);
             cudaFree(dMine);
@@ -94,9 +96,11 @@ int main()
         // ---------- 腐蚀/膨胀 ----------
         for (int k : {3, 15, 31}) {
             cv::Mat ker = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
+            auto fe = cvo::createMorphologyFilter(cv::MORPH_ERODE, CV_8UC1, ker);
+            auto fd = cvo::createMorphologyFilter(cv::MORPH_DILATE, CV_8UC1, ker);
             for (int opn = 0; opn < 2; ++opn) {
-                if (opn == 0) cvo::erode(dBin, dOutCV, ker);
-                else          cvo::dilate(dBin, dOutCV, ker);
+                if (opn == 0) fe->apply(dBin, dOutCV);
+                else          fd->apply(dBin, dOutCV);
                 cv::Mat ref; dOutCV.download(ref);
 
                 uint8_t* dMine; size_t mstep = (size_t)W;
@@ -104,15 +108,15 @@ int main()
                 if (opn == 0) gpu_erode(dBin.data, dBin.step, dMine, mstep, W, H, k, k);
                 else          gpu_dilate(dBin.data, dBin.step, dMine, mstep, W, H, k, k);
                 cv::Mat mine(H, W, CV_8UC1);
-                CUDA_CHECK(cudaMemcpy2D(mine.data, W, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
                 char name[32]; snprintf(name, 32, "%s k=%d (bin)", opn ? "dilate" : "erode", k);
                 maxDiff(mine, ref, name);
                 // 灰度图也测
                 if (opn == 0) gpu_erode(dGray.data, dGray.step, dMine, mstep, W, H, k, k);
                 else          gpu_dilate(dGray.data, dGray.step, dMine, mstep, W, H, k, k);
-                CUDA_CHECK(cudaMemcpy2D(mine.data, W, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
-                if (opn == 0) cvo::erode(dGray, dOutCV, ker);
-                else          cvo::dilate(dGray, dOutCV, ker);
+                CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
+                if (opn == 0) fe->apply(dGray, dOutCV);
+                else          fd->apply(dGray, dOutCV);
                 dOutCV.download(ref);
                 snprintf(name, 32, "%s k=%d (gray)", opn ? "dilate" : "erode", k);
                 maxDiff(mine, ref, name);
@@ -130,7 +134,7 @@ int main()
             CUDA_CHECK(cudaMallocPitch(&dMine, &mstep, W, H));
             gpu_gaussian(dGray.data, dGray.step, dMine, mstep, W, H, k, 0.f);
             cv::Mat mine(H, W, CV_8UC1);
-            CUDA_CHECK(cudaMemcpy2D(mine.data, W, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
             char name[32]; snprintf(name, 32, "gauss k=%d", k);
             maxDiff(mine, ref, name);
             cudaFree(dMine);

@@ -1,4 +1,4 @@
-// benchmark：我的算子 vs OpenCV-CUDA（同机同卡），cudaEvents 计时取中位数
+﻿// benchmark：我的算子 vs OpenCV-CUDA（同机同卡），cudaEvents 计时取中位数
 // 输出：stdout 表格 + bench_results.csv
 #include <opencv2/core.hpp>
 #include <opencv2/core/cuda.hpp>

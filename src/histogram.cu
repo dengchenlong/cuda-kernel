@@ -1,4 +1,4 @@
-// 灰度直方图（256 bins）
+﻿// 灰度直方图（256 bins）
 // 通用版：uint4 向量化读 + 每块共享内存私有直方图 + smem 原子累加，最后合并到全局
 // 二值版(0/255)：popcount 直数，把直方图问题变成纯带宽问题（二值图下比通用版快数倍）
 #include "ops.h"
@@ -16,15 +16,25 @@ __global__ void hist_kernel(const uint8_t* __restrict__ src, size_t sstep,
     __syncthreads();
 
     const bool aligned = ((sstep & 15) == 0) &&
-                         ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
+                         ((reinterpret_cast<uintptr_t>(src) & 15) == 0) &&
+                         ((W & 15) == 0);
     const size_t N = (size_t)W * H;
 
     if (aligned) {
-        const uint4* p4 = (const uint4*)src;
-        const size_t n4 = N >> 4;
+        const size_t bpr = (size_t)W >> 4;          // 每行 uint4 块数
+        const bool tight = (sstep == (size_t)W);
+        const size_t total4 = tight ? (N >> 4) : (size_t)H * bpr;
         const size_t stride = (size_t)gridDim.x * HIST_THREADS;
-        for (size_t i = blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < n4; i += stride) {
-            const uint4 v = p4[i];
+        for (size_t i = blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < total4; i += stride) {
+            const uint4* p4;
+            if (tight) {
+                p4 = (const uint4*)src + i;
+            } else {
+                const size_t y = i / bpr;
+                const size_t x4 = i - y * bpr;
+                p4 = (const uint4*)(src + y * sstep) + x4;
+            }
+            const uint4 v = *p4;
             const unsigned w[4] = { v.x, v.y, v.z, v.w };
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
@@ -33,8 +43,9 @@ __global__ void hist_kernel(const uint8_t* __restrict__ src, size_t sstep,
                     atomicAdd(&shist[(w[u] >> b) & 0xff], 1);
             }
         }
-        // 尾部（N % 16）标量处理
-        for (size_t i = (n4 << 4) + blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < N;
+        // 尾部（N % 16）标量处理：从 total4*16 开始
+        const size_t tailStart = total4 << 4;
+        for (size_t i = tailStart + blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < N;
              i += (size_t)gridDim.x * HIST_THREADS)
             atomicAdd(&shist[src[i]], 1);
         __syncthreads();
@@ -58,16 +69,26 @@ __global__ void hist_binary_kernel(const uint8_t* __restrict__ src, size_t sstep
                                    int W, int H, int* d_hist)   // d_hist[0]=255个数, d_hist[255]=0个数 之外的 bin 不写
 {
     const bool aligned = ((sstep & 15) == 0) &&
-                         ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
+                         ((reinterpret_cast<uintptr_t>(src) & 15) == 0) &&
+                         ((W & 15) == 0);
     const size_t N = (size_t)W * H;
     unsigned zeros = 0, ones = 0;
 
     if (aligned) {
-        const uint4* p4 = (const uint4*)src;
-        const size_t n4 = N >> 4;
+        const size_t bpr = (size_t)W >> 4;
+        const bool tight = (sstep == (size_t)W);
+        const size_t total4 = tight ? (N >> 4) : (size_t)H * bpr;
         const size_t stride = (size_t)gridDim.x * HIST_THREADS;
-        for (size_t i = blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < n4; i += stride) {
-            const uint4 v = p4[i];
+        for (size_t i = blockIdx.x * (size_t)HIST_THREADS + threadIdx.x; i < total4; i += stride) {
+            const uint4* p4;
+            if (tight) {
+                p4 = (const uint4*)src + i;
+            } else {
+                const size_t y = i / bpr;
+                const size_t x4 = i - y * bpr;
+                p4 = (const uint4*)(src + y * sstep) + x4;
+            }
+            const uint4 v = *p4;
             const unsigned w[4] = { v.x, v.y, v.z, v.w };
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
