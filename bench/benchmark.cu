@@ -152,12 +152,19 @@ int main(int argc, char** argv)
 
         // ---------- 直方图 ----------
         {
+            // 关键：前面形态学/均值测试把 b.u8 原地写成了大片等值平台区（opening 效应），
+            // 平台数据会让 warp 内大量 lane 落同一 bin，共享内存原子 32 路串行化 → 直方图被测出假慢 4~5 倍。
+            // 必须在计时前重传干净的随机灰度图，保证与 OpenCV（用未污染的 dGray）同口径。
+            CUDA_CHECK(cudaMemcpy2D(b.u8, b.u8step, gray.data, gray.step, W, H, cudaMemcpyHostToDevice));
             double cvb = tm.run([&] { cvo::calcHist(dBin, dOutCV); }, warmup, reps);
             double cvg = tm.run([&] { cvo::calcHist(dGray, dOutCV); }, warmup, reps);
+            CUDA_CHECK(cudaMemcpy2D(b.u8, b.u8step, bin.data, bin.step, W, H, cudaMemcpyHostToDevice));
             double mb = tm.run([&] {
                 CUDA_CHECK(cudaMemsetAsync(b.hist, 0, 256 * sizeof(int)));
                 gpu_histogram_binary(b.u8, b.u8step, W, H, b.hist);
             }, warmup, reps);
+            // 灰度版换回干净随机数据（binary 数据只有 0/255 两种取值，会人为放大原子冲突）
+            CUDA_CHECK(cudaMemcpy2D(b.u8, b.u8step, gray.data, gray.step, W, H, cudaMemcpyHostToDevice));
             double mg = tm.run([&] {
                 CUDA_CHECK(cudaMemsetAsync(b.hist, 0, 256 * sizeof(int)));
                 gpu_histogram(b.u8, b.u8step, W, H, b.hist);

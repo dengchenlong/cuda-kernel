@@ -14,6 +14,78 @@ struct MinOp { __device__ uint8_t operator()(uint8_t a, uint8_t b) const { retur
 
 // 一行/一列 = 一条线。block 处理一条线上的一个输出段(tile)。
 // 需要左邻段的后缀扫描和右邻段的前缀扫描，故 smem 里加载 3 个段。
+// 小核（k<=7）直接窗口快路径：VHG 的三段加载+双扫描对小核是纯开销
+template <typename Op>
+__global__ void direct_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int k)
+{
+    __shared__ uint8_t tile[256 + 7];           // 256 + MAX_SMALL_K - 1
+    const int y   = blockIdx.y;
+    const int x0  = blockIdx.x * 256;
+    const int tid = threadIdx.x;
+    const Op op;
+    const uint8_t* srow = src + (size_t)y * sstep;
+
+    // 越界填恒等元（腐蚀=255/膨胀=0），与 morphologyDefaultBorderValue 语义一致
+    for (int i = tid; i < 256 + k - 1; i += 256) {
+        const int gx = x0 - k / 2 + i;
+        tile[i] = (gx >= 0 && gx < W) ? srow[gx] : Op::ident();
+    }
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    uint8_t v = tile[tid];
+#pragma unroll 4
+    for (int j = 1; j < k; ++j) v = op(v, tile[tid + j]);
+    dst[(size_t)y * dstep + x] = v;
+}
+
+// 小核列遍：每线程一列的一段行区间（与高斯列遍同款分块，避免全场仅 W 线程）
+// k<=3 用 3 元直加展开（无 ring，寄存器直读）；k>3 用 k 槽 ring
+template <typename Op>
+__global__ void direct_cols_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int H, int k, int rpt)
+{
+    const int x   = blockIdx.x * 256 + threadIdx.x;
+    const int y0  = blockIdx.y * rpt;
+    const int y1  = min(H, y0 + rpt);
+    const Op op;
+    if (x >= W) return;
+
+    auto fetch = [&](int r) -> uint8_t {
+        return (r >= 0 && r < H) ? src[(size_t)r * sstep + x] : Op::ident();
+    };
+    if (k <= 3) {
+        // k=3 快路径：三寄存器滚动，无取模、无数组下标
+        uint8_t a = fetch(y0 - 1), b = fetch(y0);
+        for (int r = y0; r < y1; ++r) {
+            const uint8_t c = fetch(r + 1);
+            uint8_t v = op(a, b);
+            v = op(v, c);
+            dst[(size_t)r * dstep + x] = v;
+            a = b; b = c;
+        }
+        return;
+    }
+    // 滑动窗口 ring（k 槽）
+    uint8_t ringv[7];
+    for (int j = 0; j < k; ++j) ringv[j] = fetch(j - k / 2 + y0);
+    int oldest = 0;
+
+    for (int r = y0; r < y1; ++r) {
+        uint8_t v = ringv[oldest];
+        for (int j = 1; j < k; ++j) v = op(v, ringv[(oldest + j) % k]);
+        dst[(size_t)r * dstep + x] = v;
+        if (r + 1 < y1) {
+            ringv[oldest] = fetch(r + 1 + k / 2);
+            if (++oldest == k) oldest = 0;
+        }
+    }
+}
+
 template <typename Op>
 __global__ void vhg_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                 uint8_t* __restrict__ dst, size_t dstep,
@@ -194,17 +266,27 @@ void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
     if (width <= 0 || height <= 0) return;
     // 注意：临时缓冲必须用与 d_dst 相同的 step 布局（用 tight width 会造成
     // vhg_cols_kernel 以 dstStep 跨行读写时越界/读串行——之前 smoke 中 gray 小核差异即由此而来）
-    size_t tmpStep = 0;
-    uint8_t* tmp;
-    CUDA_CHECK(cudaMallocPitch(&tmp, &tmpStep, width, height));
+    // 用静态 workspace：cudaMallocPitch/cudaFree 每次调用会同步设备，是计时大坑
+    size_t tmpStep = (size_t)width;
+    uint8_t* tmp = ws_grow(tmpStep * height + 1024);
 
-    // 水平：每块 128 线程处理一行的一个段
-    dim3 g1(idiv_up(width, VHG_B), height), t1(VHG_B);
-    vhg_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tmpStep, width, kw);
-    // 垂直：blockIdx.y = 列号
-    dim3 g2(idiv_up(height, VHG_B), width), t2(VHG_B);
-    vhg_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tmpStep, d_dst, dstStep, height, kh);
-    cudaFree(tmp);
+    const bool smallK = kw <= 7 && kh <= 7;
+    if (smallK) {
+        // 4K 实测（probe_k3）：rows->cols 两遍直加窗口 1.19ms，比 VHG 双趟（1.95ms）快 39%，
+        // 也比此前 rows 直加+ring 慢路径快 —— k<=7 全部走此路径
+        dim3 g1(idiv_up(width, 256), height), t1(256);
+        direct_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tmpStep, width, kw);
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2(idiv_up(width, 256), idiv_up(height, rpt)), t2(256);
+        direct_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tmpStep, d_dst, dstStep, width, height, kh, rpt);
+    } else {
+        // 水平：每块 128 线程处理一行的一个段
+        dim3 g1(idiv_up(width, VHG_B), height), t1(VHG_B);
+        vhg_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tmpStep, width, kw);
+        // 垂直：blockIdx.y = 列号
+        dim3 g2(idiv_up(height, VHG_B), width), t2(VHG_B);
+        vhg_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tmpStep, d_dst, dstStep, height, kh);
+    }
 }
 
 } // anonymous namespace

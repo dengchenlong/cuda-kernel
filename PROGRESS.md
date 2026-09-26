@@ -62,12 +62,17 @@ G:\cuda-kernel
        链接加 -L"D:/opencv-cuda-build/install/x64/vc17/lib" -lopencv_core4130 -lopencv_imgproc4130 -lopencv_cudaarithm4130 -lopencv_cudafilters4130 -lopencv_cudaimgproc4130 -lopencv_cudawarping4130，运行时 PATH 加 install\x64\vc17\bin
 - [x] 跑 smoke 修正确性：全部通过（integral/morph 全核全图 identical；gauss k=5/15 identical；hist identical；mean 残差 ≤1 舍入差异，smoke 容忍 md<=1）
 - [x] 跑 benchmark 记录首轮数字进 BENCHMARK.md（2026-09-26 全尺寸全算子，见 BENCHMARK.md 表格）
-- [ ] 逐算子优化（优化思路备忘见下）直到全面 WIN，每个数字都记进 BENCHMARK.md
-       首轮 WIN：integral 全尺寸、mean k>=15、morph k>=15、hist-binary、gauss k=15 大图。
-       首轮 LOSE 待修（按差距排序）：
-       1. hist-gray 0.22~0.85x —— 256-bin smem 原子冲突严重，改 warp 私有直方图（8KB smem，冲突降 32 倍）
-       2. morph k=3 0.11~0.19x —— van Herk 双趟对 k=3 开销大，加 k<=5 直接窗口快路径
-       3. mean k=3 0.34~0.43x —— 行遍扫描对小 k 换直加窗口
-       4. gaussian k=5/15 小图 0.33~0.92x —— 列遍每列一线程全场仅 W 线程，占用率过低，按行分块（每线程 H/C 行，块间预重叠 k-1 行）
+- [x] 优化第一轮（2026-09-27 全部落地，smoke 全绿，BENCHMARK.md 已更新第二轮表格）：
+       1. benchmark 修复：hist 计时前重传干净随机数据（此前被 morph/mean 原地写成平台区，等值数据
+          令 warp 原子同 bin 串行化，hist 假慢 4~5 倍 —— 数据分布是直方图基准的第一坑）
+       2. histogram：去掉破坏 warp 合并的 ILP-2 取数（16B load stride 32B 慢 7 倍），回归 uint4 步进 32
+       3. mean：小核 k≤15 行遍直加窗口 + 列遍行分块（rpt 64@4K/16@小图）
+       4. morphology：k≤7 全走 rows 直加 + cols 行分块（k=3 三寄存器滚动），VHG 只管 k≥9；静态 workspace
+       5. gaussian：列遍行分块 rpt 上调（4K 用 64）
+- [ ] 逐算子优化（第二轮后剩余 LOSE，差距全部 <1.4x，按性价比排序）：
+       1. mean k=3 (0.65~0.78x) —— 疑似 u16 tmp 往返带宽；试 rows 融合输出（行和+列和两遍合一或 u16→u8 单遍）
+       2. hist-gray 1080p/4K (0.93~0.95x) —— 与 OpenCV 同 layout 下差 5%；试每 warp 双行、u32 载入
+       3. gaussian k=5 (0.94~0.99x) —— 全尺寸贴 1.0；试 u16 定点中间缓冲降带宽
+- [ ] 全部算子稳定 ≥1 后：README + 收尾（阶段 5）
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM

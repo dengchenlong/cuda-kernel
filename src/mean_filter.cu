@@ -38,25 +38,31 @@ __global__ void mean_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
     for (int i = N + tid; i < MF_PAD; i += MF_THREADS) sp[i] = 0;
     __syncthreads();
 
-    // Hillis-Steele inclusive scan：MF_PAD 个元素，每线程负责相邻 2 个
-#pragma unroll
-    for (int d = 1; d < MF_PAD; d <<= 1) {
-        const int i0 = 2 * tid, i1 = 2 * tid + 1;
-        uint32_t a = 0, b = 0;
-        if (i0 >= d) a = sp[i0 - d];
-        if (i1 >= d) b = sp[i1 - d];
-        __syncthreads();
-        if (i0 >= d) sp[i0] += a;
-        if (i1 >= d) sp[i1] += b;
-        __syncthreads();
-    }
-
     const int x = x0 + tid;
-    if (x < W) {
+    if (x >= W) return;
+    uint32_t sum;
+    if (k <= 15) {
+        // 小核：直加窗口 O(k)（Hillis-Steele 全宽扫描对小核是纯开销）
+        sum = 0;
+#pragma unroll 4
+        for (int j = 0; j < k; ++j) sum += sp[tid + j];
+    } else {
+        // 大核：Hillis-Steele inclusive scan：MF_PAD 个元素，每线程负责相邻 2 个
+#pragma unroll
+        for (int d = 1; d < MF_PAD; d <<= 1) {
+            const int i0 = 2 * tid, i1 = 2 * tid + 1;
+            uint32_t a = 0, b = 0;
+            if (i0 >= d) a = sp[i0 - d];
+            if (i1 >= d) b = sp[i1 - d];
+            __syncthreads();
+            if (i0 >= d) sp[i0] += a;
+            if (i1 >= d) sp[i1] += b;
+            __syncthreads();
+        }
         // 窗口 [x-half, x+half] = tile 索引 [tid, tid+k-1]
-        const uint32_t sum = sp[tid + k - 1] - (tid > 0 ? sp[tid - 1] : 0);
-        tmp[(size_t)y * (tstep >> 1) + x] = (uint16_t)sum;
+        sum = sp[tid + k - 1] - (tid > 0 ? sp[tid - 1] : 0);
     }
+    tmp[(size_t)y * (tstep >> 1) + x] = (uint16_t)sum;
 }
 
 // 列遍：每线程一列，沿 y 滑动，u16 和 -> 归一化 u8
@@ -85,6 +91,33 @@ __global__ void mean_cols_kernel(const uint16_t* __restrict__ tmp, size_t tstep,
     }
 }
 
+// 列遍（行分块版）：每线程处理一列的一段行区间，全场线程数 = W * ceil(H/rpt)。
+// 小核（k<=15）专用：每输出行做 O(k) 直加（tmp 是 u16 行和，直加比滑动 ring 更省寄存器/更少依赖链）
+__global__ void mean_cols_blocked_kernel(const uint16_t* __restrict__ tmp, size_t tstep,
+                                          uint8_t* __restrict__ dst, size_t dstep,
+                                          int W, int H, int kh, float inv_area, int rpt)
+{
+    const int x = blockIdx.x * MF_THREADS + threadIdx.x;
+    if (x >= W) return;
+    const int half = kh >> 1;
+    const uint16_t* tcol = (const uint16_t*)((const uint8_t*)tmp + x * 2);
+    const size_t trows = tstep >> 1;
+
+    auto fetch = [=](int r) -> uint32_t {
+        return tcol[(size_t)mirror101<false>(r, H) * trows];
+    };
+
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    for (int y = y0; y < y1; ++y) {
+        uint32_t sum = 0;
+#pragma unroll 4
+        for (int j = -half; j <= half; ++j) sum += fetch(y + j);
+        const int v = __float2int_rn((float)sum * inv_area);
+        dst[(size_t)y * dstep + x] = (uint8_t)max(0, min(255, v));
+    }
+}
+
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
 void* ws_grow(size_t need) {
@@ -105,7 +138,16 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
     dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
     mean_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
 
-    dim3 g2(idiv_up(width, MF_THREADS)), t2(MF_THREADS);
-    mean_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh,
-                                             1.0f / (float)(kw * kh));
+    const float inv_area = 1.0f / (float)(kw * kh);
+    if (kw <= 15 && kh <= 15) {
+        // 小核列遍走行分块（全场 W*ceil(H/rpt) 线程）；4K 实测 rpt=64 最优，小图 rpt=16 更好
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2(idiv_up(width, MF_THREADS), idiv_up(height, rpt)), t2(MF_THREADS);
+        mean_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                        width, height, kh, inv_area, rpt);
+    } else {
+        // 大核：每列一线程滑动窗口 O(1)/像素（行分块会让每线程重复 O(k) 直加，不划算）
+        dim3 g2(idiv_up(width, MF_THREADS)), t2(MF_THREADS);
+        mean_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
+    }
 }

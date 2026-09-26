@@ -55,12 +55,15 @@ __global__ void gauss_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
 // 8U→32F 行遍、32F→8U 列遍时舍入规则可能与单精度 MAC 不同；这里实测校准。
 __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,   // sstep 字节
                                   uint8_t* __restrict__ dst, size_t dstep,
-                                  int W, int H, int k)
+                                  int W, int H, int k, int rpt)
 {
     extern __shared__ float ring[];             // k * C_THREADS，线程 tid 私有列 = ring[tid + slot*C_THREADS]
     const int tid = threadIdx.x;
     const int x = blockIdx.x * C_THREADS + tid;
     if (x >= W) return;
+
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);            // 本线程负责的行区间 [y0, y1)
 
     const int half = k / 2;
     const size_t srows = sstep >> 2;
@@ -75,12 +78,12 @@ __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,  
         return scol[(size_t)rr * srows];
     };
 
-    // 预加载窗口行 r = -half .. -half + k - 1，slot 0 = 最旧
+    // 预加载窗口行 r = y0-half .. y0-half + k - 1，slot 0 = 最旧
     for (int j = 0; j < k; ++j)
-        col[j * C_THREADS] = fetch(j - half);
+        col[j * C_THREADS] = fetch(j - half + y0);
     int oldest = 0;
 
-    for (int r = 0; r < H; ++r) {
+    for (int r = y0; r < y1; ++r) {
         // 与 OpenCV 的 row/col 滤波舍入一致：round-half-away-from-zero（cvRound 语义）
         float acc = 0.f;
         int slot = oldest;
@@ -94,7 +97,7 @@ __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,  
         v = max(0, min(255, v));
         dst[(size_t)r * dstep + x] = (uint8_t)v;
 
-        if (r + 1 < H) {
+        if (r + 1 < y1) {
             col[oldest * C_THREADS] = fetch(r + 1 + half);   // 滚入新行
             if (++oldest == k) oldest = 0;
         }
@@ -175,7 +178,10 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     }
     {
         const int smem = ksize * C_THREADS * (int)sizeof(float);
-        dim3 g(idiv_up(width, C_THREADS)), t(C_THREADS);
-        gauss_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize);
+        // 列遍按行分块：全场线程数 = W * ceil(H/rpt)，否则每列一线程时只有 W 线程（占用率过低）
+        // 4K 实测 rpt=64 最优（>32 后重复读的代价被占用率收益盖过；小图 rpt=8~16 更好，见 probe_k3）
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
+        gauss_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
     }
 }
