@@ -43,7 +43,7 @@ G:\cuda-kernel
 2. [x] 逐算子实现+正确性验证（vs OpenCV 结果逐像素比对，smoke 全绿，mean ±1 舍入容差）
 3. [x] benchmark 框架：cudaEvents 计时，多分辨率 {640x480, 1280x720, 1920x1080, 3840x2160}，二值图/灰度图/自然图，预热+多次重复取中位
 4. [x] 逐算子疯狂优化直到稳定 ≥ OpenCV（三轮优化后全算子×全尺寸×全参数 WIN，见 BENCHMARK.md 第三轮）
-5. [进行中] 收尾：README + BENCHMARK.md 数据齐全，全部算子达标
+5. [x] 收尾：README.md + BENCHMARK.md 数据齐全，全部算子达标（2026-09-28 项目完成）
 
 ## 优化思路备忘
 - sm_61 无张量核；优化抓手：向量化访存 (uint4/float4)、warp shuffle 扫描、共享内存 tiling+无 bank conflict、分离算法降复杂度、占满 SM (grid 足够大)、-O3 --use_fast_math、常量内存存核参数
@@ -81,7 +81,9 @@ G:\cuda-kernel
               在该核下中间值全为二进分数，浮点结果恰为 S_total/256，逐位一致（smoke identical）
        附带：hist-binary 同步改 last-block，2~4.9x → 2.5~6.5x
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
-- [ ] 收尾（阶段 5）：README（构建方法、API、benchmark 复现步骤、结果摘要）
+- [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
+- [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
+      的补充核（如 hist 非 16 倍数宽度的向量化、k=7 高斯定点路径、CV_32F 输入格式），非必需
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
