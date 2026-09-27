@@ -146,7 +146,7 @@ int main()
             cvo::calcHist(dGray, dOutCV);
             cv::Mat ref; dOutCV.download(ref);
             int* dMine; CUDA_CHECK(cudaMalloc(&dMine, 256 * sizeof(int)));
-            CUDA_CHECK(cudaMemset(dMine, 0, 256 * sizeof(int)));
+            // 新契约：hist kernel 完全覆写全 256 bin，不做任何预清零直接验证
             gpu_histogram(dGray.data, dGray.step, W, H, dMine);
             int mine[256]; CUDA_CHECK(cudaMemcpy(mine, dMine, sizeof(mine), cudaMemcpyDeviceToHost));
             const int* rp = ref.ptr<int>();
@@ -156,7 +156,6 @@ int main()
             if (md) ++g_fail;
 
             // 二值
-            CUDA_CHECK(cudaMemset(dMine, 0, 256 * sizeof(int)));
             gpu_histogram_binary(dBin.data, dBin.step, W, H, dMine);
             CUDA_CHECK(cudaMemcpy(mine, dMine, sizeof(mine), cudaMemcpyDeviceToHost));
             cvo::calcHist(dBin, dOutCV);

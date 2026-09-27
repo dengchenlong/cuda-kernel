@@ -1,64 +1,83 @@
 ﻿// 灰度直方图（256 bins）
-// 设计参照 OpenCV 的 Emulation::smem::atomicAdd（warp vote 选 leader + 块内 blockScanInclusive 归约）：
-// 同 warp 内落同 bin 的线程只让 leader 做一次 smem 原子 —— 随机数据下冲突率高，比裸 atomicAdd 快数倍
-// 通用版：uint4 向量化读；每行每 warp 处理 32 个 uint4 块；块尾 256-bin block scan 归约全局
-// 二值版(0/255)：popcount 直数，把直方图问题变成纯带宽问题（二值图下比通用版快数倍）
+// 设计：uint4 向量化读 + smem 私有直方图 + **last-block 归约**（probe_h4 实测）：
+//   - 各 block 把 smem 直方图写入自己的 partials 槽（普通写，无全局原子），
+//     最后完成的 block 汇总所有 partials 并**完全覆写** d_hist（256 bin 全写）。
+//   - 因此调用前**无需清零 d_hist**（旧版靠 cudaMemsetAsync 预清零，实测在计时内
+//     固定多花 ~20us —— 比直方图本体还贵，是 benchmark 口径里的隐形大头）。
+//   - counter 用 atomicInc 回绕归零，同一 stream 连续调用安全（与 static workspace 同约束）。
+// 二值版(0/255)：popcount 直数，同样 last-block 归约，输出全 256 bin（非 0/255 bin 恒 0）。
 #include "ops.h"
 
 namespace {
 
 constexpr int HIST_THREADS = 256;
+constexpr int HIST_GRID = 48;        // 6 SM × 8 block/SM，probe_h4 实测各尺寸最优
+constexpr int HIST_GRID_MAX = 256;   // 二值版用 256 block
 
-// smem 直加：无 warp 合并（Pascal 无 match_any，OpenCV 实际也是裸 ::atomicAdd —— 见 emulation.hpp）
-// 直方图瓶颈在 smem 原子吞吐，冲突由 bank 序列化天然处理；OpenCV 4K 跑 55.9GP/s 证明这条路够快
-__device__ __forceinline__ void smem_atomic_add(int* address, unsigned int val)
-{
-    atomicAdd(address, (int)val);
+struct HistWS {
+    int* partials = nullptr;      // [HIST_GRID_MAX * 256] int，灰度版每 block 256 bin；二值版每 block 2 个
+    unsigned* counter = nullptr;  // last-block 计数器，atomicInc 自动回绕归零
+};
+HistWS& ws() { static HistWS w; return w; }
+void ws_init() {
+    HistWS& w = ws();
+    if (!w.partials) {
+        CUDA_CHECK(cudaMalloc(&w.partials, (size_t)HIST_GRID_MAX * 256 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&w.counter, sizeof(unsigned)));
+        CUDA_CHECK(cudaMemset(w.counter, 0, sizeof(unsigned)));
+    }
 }
-constexpr int HIST_BLOCKS_DEFAULT = 256;
 
-__global__ void hist_kernel(const uint8_t* __restrict__ src, size_t sstep,
-                            int W, int H, int* __restrict__ d_hist)
+// ---------- 灰度 fast path（W 为 16 倍数且对齐）：uint4 合并读 ----------
+// OpenCV 同款布局：每 block 每行 32 线程；步内取 2 的 ILP 变体会破坏合并，实测慢 7 倍，勿改
+__global__ void hist_lastblock_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                      int W, int H, int* __restrict__ d_hist,
+                                      int* __restrict__ partials, unsigned* __restrict__ counter)
 {
-    // OpenCV 同款布局：每 block 8 行 × 32 线程/行，block 内共享一份 256-bin smem 直方图
     __shared__ int shist[256];
+    __shared__ bool amLast;
     const int tid = threadIdx.y * 32 + threadIdx.x;
     shist[tid] = 0;
     __syncthreads();
-
-    const int y = blockIdx.x * blockDim.y + threadIdx.y;
-    if (y < H) {
-        const uint8_t* row = src + (size_t)y * sstep;
+    for (int y = blockIdx.x * blockDim.y + threadIdx.y; y < H; y += gridDim.x * blockDim.y) {
+        const uint4* row4 = (const uint4*)(src + (size_t)y * sstep);
         const unsigned cols4 = (unsigned)W >> 4;
-        const uint4* row4 = (const uint4*)row;         // W 为 16 倍数且 step 对齐（不满足走标量回退）
-        // 每线程一列 uint4、步进 32（warp 完美合并；步内取 2 的 ILP 变体会破坏合并，实测慢 7 倍）
         for (unsigned x = threadIdx.x; x < cols4; x += 32) {
             const uint4 v = row4[x];
             const unsigned w[4] = { v.x, v.y, v.z, v.w };
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < 4; ++u)
 #pragma unroll
                 for (int b = 0; b < 32; b += 8)
                     atomicAdd(&shist[(w[u] >> b) & 0xff], 1);
-            }
         }
-        // 行尾（W % 16）标量：全 warp 合作处理（W=16k 时无开销）
     }
     __syncthreads();
-    // 简单归约：每线程负责 1 bin，直接求和写全局（256 原子 vs 扫描的复杂度，实测更快更稳）
-    {
-        const int s = shist[tid];
-        if (s) atomicAdd(&d_hist[tid], s);
+    int* myp = partials + blockIdx.x * 256;
+    myp[tid] = shist[tid];
+    __threadfence();
+    if (tid == 0) {
+        const unsigned ticket = atomicInc(counter, gridDim.x - 1);
+        amLast = (ticket == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (amLast) {
+        int s = 0;
+        for (int b = 0; b < (int)gridDim.x; ++b) s += partials[b * 256 + tid];
+        d_hist[tid] = s;   // 全 256 bin 完全覆写
     }
 }
 
-// 标量回退：W 非 4 倍数或 step 不对齐（正确性兜底）
-__global__ void hist_scalar_kernel(const uint8_t* __restrict__ src, size_t sstep,
-                                   int W, int H, int* __restrict__ d_hist)
+// ---------- 标量回退（W 非 16 倍数或不对齐）：per-warp 私有 hist + last-block 归约 ----------
+__global__ void hist_scalar_lastblock_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                             int W, int H, int* __restrict__ d_hist,
+                                             int* __restrict__ partials, unsigned* __restrict__ counter)
 {
     __shared__ int whist[HIST_THREADS / 32][256];
+    __shared__ bool amLast;
 #pragma unroll
-    for (int i = threadIdx.x; i < (HIST_THREADS / 32) * 256; i += HIST_THREADS) whist[i / 256][i % 256] = 0;
+    for (int i = threadIdx.x; i < (HIST_THREADS / 32) * 256; i += HIST_THREADS)
+        whist[i / 256][i % 256] = 0;
     __syncthreads();
     int* myh = whist[threadIdx.x >> 5];
     for (int y = blockIdx.x; y < H; y += gridDim.x) {
@@ -67,18 +86,30 @@ __global__ void hist_scalar_kernel(const uint8_t* __restrict__ src, size_t sstep
             atomicAdd(&myh[row[x]], 1);
     }
     __syncthreads();
-    for (int b = threadIdx.x; b < 256; b += HIST_THREADS) {
-        int s = 0;
+    int s = 0;
 #pragma unroll
-        for (int w = 0; w < HIST_THREADS / 32; ++w) s += whist[w][b];
-        if (s) atomicAdd(&d_hist[b], s);
+    for (int wq = 0; wq < HIST_THREADS / 32; ++wq) s += whist[wq][threadIdx.x];
+    int* myp = partials + blockIdx.x * 256;
+    myp[threadIdx.x] = s;
+    __threadfence();
+    if (threadIdx.x == 0) {
+        const unsigned ticket = atomicInc(counter, gridDim.x - 1);
+        amLast = (ticket == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (amLast) {
+        int t = 0;
+        for (int b = 0; b < (int)gridDim.x; ++b) t += partials[b * 256 + threadIdx.x];
+        d_hist[threadIdx.x] = t;
     }
 }
 
-// 二值版：统计 0 与 255 的个数（假设像素只有 0/255；其他值不关心）
-__global__ void hist_binary_kernel(const uint8_t* __restrict__ src, size_t sstep,
-                                   int W, int H, int* d_hist)   // d_hist[0]=255个数, d_hist[255]=0个数 之外的 bin 不写
+// ---------- 二值版：统计 0 与 255 的个数（popcount，纯带宽问题）----------
+__global__ void hist_binary_lastblock_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                             int W, int H, int* __restrict__ d_hist,
+                                             int* __restrict__ partials, unsigned* __restrict__ counter)
 {
+    __shared__ bool amLast;
     const bool aligned = ((sstep & 15) == 0) &&
                          ((reinterpret_cast<uintptr_t>(src) & 15) == 0) &&
                          ((W & 15) == 0);
@@ -139,9 +170,22 @@ __global__ void hist_binary_kernel(const uint8_t* __restrict__ src, size_t sstep
             ones += __shfl_down_sync(0xffffffffu, ones, d);
         }
         if (lane == 0) {
-            if (zeros) atomicAdd(&d_hist[0], zeros);
-            if (ones) atomicAdd(&d_hist[255], ones);
+            int* myp = partials + blockIdx.x * 2;
+            myp[0] = (int)zeros;
+            myp[1] = (int)ones;
+            __threadfence();
+            const unsigned ticket = atomicInc(counter, gridDim.x - 1);
+            amLast = (ticket == gridDim.x - 1);
         }
+    }
+    __syncthreads();
+    if (amLast) {
+        // 全 256 bin 完全覆写：bin 0 = 0 的个数，bin 255 = 255 的个数，其余恒 0
+        int s = 0;
+        if (threadIdx.x == 0 || threadIdx.x == 255) {
+            for (int b = 0; b < (int)gridDim.x; ++b) s += partials[b * 2 + (threadIdx.x ? 1 : 0)];
+        }
+        d_hist[threadIdx.x] = (threadIdx.x == 0) ? s : (threadIdx.x == 255) ? s : 0;
     }
 }
 
@@ -150,26 +194,26 @@ __global__ void hist_binary_kernel(const uint8_t* __restrict__ src, size_t sstep
 void gpu_histogram(const uint8_t* d_src, size_t srcStep,
                    int width, int height, int* d_hist, cudaStream_t stream)
 {
+    ws_init();
     const bool aligned4 = ((srcStep & 15) == 0) &&
                           ((reinterpret_cast<uintptr_t>(d_src) & 15) == 0) &&
                           ((width & 15) == 0);
     if (aligned4) {
         const dim3 t(32, 8);
-        const dim3 g((height + 7) / 8);
-        hist_kernel<<<g, t, 0, stream>>>(d_src, srcStep, width, height, d_hist);
+        hist_lastblock_kernel<<<HIST_GRID, t, 0, stream>>>(d_src, srcStep, width, height,
+                                                           d_hist, ws().partials, ws().counter);
     } else {
-        dim3 g(256), t(256);
-        hist_scalar_kernel<<<g, t, 0, stream>>>(d_src, srcStep, width, height, d_hist);
+        hist_scalar_lastblock_kernel<<<HIST_GRID, HIST_THREADS, 0, stream>>>(
+            d_src, srcStep, width, height, d_hist, ws().partials, ws().counter);
     }
 }
 
-// 二值图专用：调用前把 d_hist[0] 和 d_hist[255] 清零（其余 bin 恒为 0）
-void gpu_histogram_binary(const uint8_t* d_src, size_t srcStep,
-                          int width, int height, int* d_hist, cudaStream_t stream);
-
+// 二值图专用：输出全 256 bin（bin0=0 的个数、bin255=255 的个数、其余 0），调用前无需清零
 void gpu_histogram_binary(const uint8_t* d_src, size_t srcStep,
                           int width, int height, int* d_hist, cudaStream_t stream)
 {
-    dim3 g(HIST_BLOCKS_DEFAULT), t(HIST_THREADS);
-    hist_binary_kernel<<<g, t, 0, stream>>>(d_src, srcStep, width, height, d_hist);
+    ws_init();
+    dim3 g(HIST_GRID_MAX), t(HIST_THREADS);
+    hist_binary_lastblock_kernel<<<g, t, 0, stream>>>(d_src, srcStep, width, height,
+                                                      d_hist, ws().partials, ws().counter);
 }

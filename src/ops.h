@@ -35,10 +35,12 @@ void gpu_dilate(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dst
 void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
                   int width, int height, int ksize, float sigma, cudaStream_t stream = 0);
 
-// ============ 灰度直方图 (256 bins, 输出 int[256], 调用前需清零) ============
+// ============ 灰度直方图 (256 bins, 输出 int[256]) ============
+// last-block 归约实现：全 256 bin 完全覆写，调用前无需清零（stream 内多次调用安全）
 void gpu_histogram(const uint8_t* d_src, size_t srcStep,
                    int width, int height, int* d_hist, cudaStream_t stream = 0);
 
-// 二值图(0/255)专用直方图：只写 bin 0 与 bin 255（调用前需清零）
+// 二值图(0/255)专用直方图：全 256 bin 完全覆写（bin0=0 的个数、bin255=255 的个数、其余恒 0），
+// 调用前无需清零
 void gpu_histogram_binary(const uint8_t* d_src, size_t srcStep,
                           int width, int height, int* d_hist, cudaStream_t stream = 0);

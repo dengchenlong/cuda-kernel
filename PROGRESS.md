@@ -42,8 +42,8 @@ G:\cuda-kernel
 1. [进行中] 环境搭建：装 VS2022BT → 编 OpenCV-CUDA (D:\opencv-cuda-build)
 2. [x] 逐算子实现+正确性验证（vs OpenCV 结果逐像素比对，smoke 全绿，mean ±1 舍入容差）
 3. [x] benchmark 框架：cudaEvents 计时，多分辨率 {640x480, 1280x720, 1920x1080, 3840x2160}，二值图/灰度图/自然图，预热+多次重复取中位
-4. [进行中] 逐算子疯狂优化直到稳定 ≥ OpenCV（记录每次优化前后的数字进 BENCHMARK.md）
-5. [ ] 收尾：README + BENCHMARK.md 数据齐全，全部算子达标
+4. [x] 逐算子疯狂优化直到稳定 ≥ OpenCV（三轮优化后全算子×全尺寸×全参数 WIN，见 BENCHMARK.md 第三轮）
+5. [进行中] 收尾：README + BENCHMARK.md 数据齐全，全部算子达标
 
 ## 优化思路备忘
 - sm_61 无张量核；优化抓手：向量化访存 (uint4/float4)、warp shuffle 扫描、共享内存 tiling+无 bank conflict、分离算法降复杂度、占满 SM (grid 足够大)、-O3 --use_fast_math、常量内存存核参数
@@ -69,10 +69,20 @@ G:\cuda-kernel
        3. mean：小核 k≤15 行遍直加窗口 + 列遍行分块（rpt 64@4K/16@小图）
        4. morphology：k≤7 全走 rows 直加 + cols 行分块（k=3 三寄存器滚动），VHG 只管 k≥9；静态 workspace
        5. gaussian：列遍行分块 rpt 上调（4K 用 64）
-- [ ] 逐算子优化（第二轮后剩余 LOSE，差距全部 <1.4x，按性价比排序）：
-       1. mean k=3 (0.65~0.78x) —— 疑似 u16 tmp 往返带宽；试 rows 融合输出（行和+列和两遍合一或 u16→u8 单遍）
-       2. hist-gray 1080p/4K (0.93~0.95x) —— 与 OpenCV 同 layout 下差 5%；试每 warp 双行、u32 载入
-       3. gaussian k=5 (0.94~0.99x) —— 全尺寸贴 1.0；试 u16 定点中间缓冲降带宽
-- [ ] 全部算子稳定 ≥1 后：README + 收尾（阶段 5）
+- [x] 逐算子优化（第二轮后剩余 LOSE，差距全部 <1.4x，按性价比排序）——三项全部完成：
+       1. [x] mean k=3 (0.65~0.78x) → 1.17~1.71x：弃两遍分离，改单遍 3x3 直加（smem tile 32x8，
+              有效流量 6B/px→~2B/px），整数窗口和与分离法一致，输出逐位相同
+       2. [x] hist-gray 1080p/4K (0.93~0.95x) → 1.35~2.86x：真瓶颈不是 smem 原子（probe_h2/h3 证伪：
+              warp 私有 hist、2/4 uint4 取数均在噪声内），而是计时内 cudaMemsetAsync 预清零固定
+              ~20us；改 last-block 归约（block 写 partials → atomicInc 回绕计数 → 末块汇总覆写全
+              256 bin），契约改为"调用前无需清零"，grid 固定 48（6SM×8 最优）
+       3. [x] gaussian k=5 (0.94~0.99x) → 1.37~1.60x：固定核 [1,4,6,4,1]/16 走定点整数路径，
+              u16 tmp 存未归一化行部分和（≤4080），列遍整数累加 ×1/256；OpenCV CV_32F 分离滤波
+              在该核下中间值全为二进分数，浮点结果恰为 S_total/256，逐位一致（smoke identical）
+       附带：hist-binary 同步改 last-block，2~4.9x → 2.5~6.5x
+- [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
+- [ ] 收尾（阶段 5）：README（构建方法、API、benchmark 复现步骤、结果摘要）
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
-- 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM
+- 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
+  同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
+  直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突

@@ -118,6 +118,39 @@ __global__ void mean_cols_blocked_kernel(const uint16_t* __restrict__ tmp, size_
     }
 }
 
+// k=3 专用：单遍 3x3 直加（smem tile，每 block 32x8 输出）
+// 两遍分离法对 k=3 的 u16 tmp 往返带宽（4B/px）占比过高；单遍直加有效流量 ~2B/px。
+// 整数窗口和与分离法完全一致，输出逐位相同。
+__global__ void mean3_direct_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                    uint8_t* __restrict__ dst, size_t dstep,
+                                    int W, int H, float inv_area)
+{
+    constexpr int TW = 32, TH = 8;
+    constexpr int TN = (TH + 2) * (TW + 2);   // 340 字节 tile
+    __shared__ uint8_t tile[TH + 2][TW + 2];
+    const int x0 = blockIdx.x * TW;
+    const int y0 = blockIdx.y * TH;
+    const int tid = threadIdx.x;              // 256 线程
+
+    for (int i = tid; i < TN; i += 256) {
+        const int ty = i / (TW + 2), tx = i - ty * (TW + 2);
+        tile[ty][tx] = src[(size_t)mirror101<false>(y0 - 1 + ty, H) * sstep +
+                           mirror101<true>(x0 - 1 + tx, W)];
+    }
+    __syncthreads();
+
+    const int ty = tid >> 5, tx = tid & 31;
+    const int x = x0 + tx, y = y0 + ty;
+    if (x < W && y < H) {
+        const int sy = ty + 1, sx = tx + 1;
+        uint32_t sum = tile[sy - 1][sx - 1] + tile[sy - 1][sx] + tile[sy - 1][sx + 1] +
+                       tile[sy][sx - 1]     + tile[sy][sx]     + tile[sy][sx + 1] +
+                       tile[sy + 1][sx - 1] + tile[sy + 1][sx] + tile[sy + 1][sx + 1];
+        const int v = __float2int_rn((float)sum * inv_area);
+        dst[(size_t)y * dstep + x] = (uint8_t)max(0, min(255, v));
+    }
+}
+
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
 void* ws_grow(size_t need) {
@@ -132,13 +165,19 @@ inline int idiv_up(int a, int b) { return (a + b - 1) / b; }
 void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
               int width, int height, int kw, int kh, cudaStream_t stream)
 {
+    const float inv_area = 1.0f / (float)(kw * kh);
+    if (kw == 3 && kh == 3) {
+        // k=3 单遍直加：有效流量 ~2B/px，远胜两遍分离法的 6B/px
+        dim3 g(idiv_up(width, 32), idiv_up(height, 8)), t(256);
+        mean3_direct_kernel<<<g, t, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area);
+        return;
+    }
     const size_t tstep = (size_t)width * 2;
     uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
 
     dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
     mean_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
 
-    const float inv_area = 1.0f / (float)(kw * kh);
     if (kw <= 15 && kh <= 15) {
         // 小核列遍走行分块（全场 W*ceil(H/rpt) 线程）；4K 实测 rpt=64 最优，小图 rpt=16 更好
         const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;

@@ -104,6 +104,84 @@ __global__ void gauss_cols_kernel(const float* __restrict__ src, size_t sstep,  
     }
 }
 
+// ---------------- k=5 固定核 [1,4,6,4,1]/16 的定点整数路径（sigma<=0）----------------
+// rows: u8 -> u16 存未归一化行部分和 S = Σ intw_i * v_i（≤4080，精确）；
+// cols: 整型累加 S_total = Σ intw_j * S_j（≤65280），输出 __float2int_rn(S_total / 256)。
+// 全程精确：OpenCV 的 CV_32F 分离滤波在 k=5 固定核下所有中间值均为二进分数、float32 可
+// 精确表示，浮点结果 = S_total/256（无舍入），因此本路径与其逐位一致。
+// tmp 带宽 4B/px -> 2B/px（单侧），两遍合计 10B/px -> 6B/px。
+__global__ void gauss5_rows_u16_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                       uint16_t* __restrict__ dst, size_t dstep,   // dstep 字节
+                                       int W)
+{
+    extern __shared__ uint8_t tile[];           // R_THREADS + 4
+    const int y = blockIdx.y;
+    const int x0 = blockIdx.x * R_THREADS;
+    const int tid = threadIdx.x;
+    const uint8_t* srow = src + (size_t)y * sstep;
+    const int N = R_THREADS + 4;
+
+    for (int i = tid; i < N; i += R_THREADS) {
+        int x = x0 - 2 + i;
+        if (x < 0)  x = -x;
+        if (x >= W) x = 2 * W - 2 - x;
+        x = max(0, min(W - 1, x));
+        tile[i] = srow[x];
+    }
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    const unsigned acc = tile[tid] + (tile[tid + 1] << 2) + 6u * tile[tid + 2] +
+                         (tile[tid + 3] << 2) + tile[tid + 4];
+    dst[(size_t)y * (dstep >> 1) + x] = (uint16_t)acc;
+}
+
+__global__ void gauss5_cols_u16_kernel(const uint16_t* __restrict__ src, size_t sstep,   // sstep 字节
+                                       uint8_t* __restrict__ dst, size_t dstep,
+                                       int W, int H, int rpt)
+{
+    extern __shared__ uint16_t ring16[];          // 5 * C_THREADS
+    const int tid = threadIdx.x;
+    const int x = blockIdx.x * C_THREADS + tid;
+    if (x >= W) return;
+
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    const size_t srows = sstep >> 1;
+    const uint16_t* scol = src + x;
+    uint16_t* col = ring16 + tid;
+
+    auto fetch = [=](int r) -> uint16_t {
+        int rr = r;
+        if (rr < 0)  rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol[(size_t)rr * srows];
+    };
+
+    for (int j = 0; j < 5; ++j) col[j * C_THREADS] = fetch(j - 2 + y0);
+    int oldest = 0;
+
+    for (int r = y0; r < y1; ++r) {
+        unsigned acc = 0;
+        int slot = oldest;
+#pragma unroll
+        for (int j = 0; j < 5; ++j) {
+            constexpr unsigned iw[5] = { 1u, 4u, 6u, 4u, 1u };
+            acc += iw[j] * col[slot * C_THREADS];
+            if (++slot == 5) slot = 0;
+        }
+        // acc/256 精确可表示（≤255，8 位二进小数），__float2int_rn 与 float 路径/OpenCV 同语义
+        const int v = __float2int_rn((float)acc * (1.f / 256.f));
+        dst[(size_t)r * dstep + x] = (uint8_t)max(0, min(255, v));
+        if (r + 1 < y1) {
+            col[oldest * C_THREADS] = fetch(r + 1 + 2);
+            if (++oldest == 5) oldest = 0;
+        }
+    }
+}
+
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
 void* ws_grow(size_t need) {
@@ -164,6 +242,26 @@ static void make_gauss_kernel(int ksize, double sigma, float* w)
 void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
                   int width, int height, int ksize, float sigma, cudaStream_t stream)
 {
+    const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+
+    // k=5 固定核（sigma<=0）走定点整数路径：u16 tmp 带宽减半，逐位结果不变
+    if (ksize == 5 && sigma <= 0.f) {
+        const size_t tstep = (size_t)width * 2;
+        uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
+        {
+            const int smem = R_THREADS + 4;
+            dim3 g(idiv_up(width, R_THREADS), height), t(R_THREADS);
+            gauss5_rows_u16_kernel<<<g, t, smem, stream>>>(d_src, srcStep, tmp, tstep, width);
+        }
+        {
+            const int smem = 5 * C_THREADS * (int)sizeof(uint16_t);
+            dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
+            gauss5_cols_u16_kernel<<<g, t, smem, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                           width, height, rpt);
+        }
+        return;
+    }
+
     float hw[MAX_K];
     make_gauss_kernel(ksize, sigma, hw);
     CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
@@ -180,7 +278,6 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
         const int smem = ksize * C_THREADS * (int)sizeof(float);
         // 列遍按行分块：全场线程数 = W * ceil(H/rpt)，否则每列一线程时只有 W 线程（占用率过低）
         // 4K 实测 rpt=64 最优（>32 后重复读的代价被占用率收益盖过；小图 rpt=8~16 更好，见 probe_k3）
-        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
         dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
         gauss_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
     }

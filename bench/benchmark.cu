@@ -159,14 +159,14 @@ int main(int argc, char** argv)
             double cvb = tm.run([&] { cvo::calcHist(dBin, dOutCV); }, warmup, reps);
             double cvg = tm.run([&] { cvo::calcHist(dGray, dOutCV); }, warmup, reps);
             CUDA_CHECK(cudaMemcpy2D(b.u8, b.u8step, bin.data, bin.step, W, H, cudaMemcpyHostToDevice));
+            // 新契约：hist kernel 完全覆写全部 256 bin，无需（也不再）预清零 —— 旧版计时内的
+            // cudaMemsetAsync 实测固定多花 ~20us，比直方图本体还贵（见 probe_h4）
             double mb = tm.run([&] {
-                CUDA_CHECK(cudaMemsetAsync(b.hist, 0, 256 * sizeof(int)));
                 gpu_histogram_binary(b.u8, b.u8step, W, H, b.hist);
             }, warmup, reps);
             // 灰度版换回干净随机数据（binary 数据只有 0/255 两种取值，会人为放大原子冲突）
             CUDA_CHECK(cudaMemcpy2D(b.u8, b.u8step, gray.data, gray.step, W, H, cudaMemcpyHostToDevice));
             double mg = tm.run([&] {
-                CUDA_CHECK(cudaMemsetAsync(b.hist, 0, 256 * sizeof(int)));
                 gpu_histogram(b.u8, b.u8step, W, H, b.hist);
             }, warmup, reps);
             report("hist-binary", W, H, "", mb, cvb);
