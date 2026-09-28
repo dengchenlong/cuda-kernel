@@ -80,6 +80,9 @@ G:\cuda-kernel
               u16 tmp 存未归一化行部分和（≤4080），列遍整数累加 ×1/256；OpenCV CV_32F 分离滤波
               在该核下中间值全为二进分数，浮点结果恰为 S_total/256，逐位一致（smoke identical）
        附带：hist-binary 同步改 last-block，2~4.9x → 2.5~6.5x
+- [x] 增补（2026-09-29）：gaussian k=7 定点整数路径（sigma<=0），弃错误的首版（未缩放行和×
+      缩放权重=输出×64 饱和），改整数 MAC + ×(1/4096)，smoke identical；bench 加 k=7 列，
+      全尺寸 1.35~1.60x WIN，BENCHMARK.md 第四轮
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径

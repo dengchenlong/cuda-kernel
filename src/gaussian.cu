@@ -182,6 +182,87 @@ __global__ void gauss5_cols_u16_kernel(const uint16_t* __restrict__ src, size_t 
     }
 }
 
+// ---------------- k=7 固定核 [2,7,14,18,14,7,2]/64 的 u16 定点 tmp 路径（sigma<=0）----------------
+// rows: u8 -> u16 精确整数行部分和 S = Σ intw_i * v_i（≤16320，不缩放）；
+// cols: 整数 MAC（同 k=5 模式）：acc = Σ intw_j * S_j ≤ 64*16320 = 1,044,480 < 2^21，
+// float 精确表示，最后 ×(1/4096)（=64×64，2 的幂，乘法精确）——与 OpenCV CV_32F 管线
+// （行缩放 1/64 与列缩放 1/64 全程精确、总和为 1/4096 的整数倍）逐位一致。
+// 注意：不能像旧版那样 cols 直接乘缩放后的 float 权重 w_j=intw_j/64——行和未缩放，
+// 再乘缩放权重会多出 64×（输出整体饱和到 255）。
+// tmp 带宽 8B/px → 4B/px。
+__global__ void gauss7_rows_u16_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                       uint16_t* __restrict__ dst, size_t dstep,   // dstep 字节
+                                       int W)
+{
+    extern __shared__ uint8_t tile7[];          // R_THREADS + 6
+    const int y = blockIdx.y;
+    const int x0 = blockIdx.x * R_THREADS;
+    const int tid = threadIdx.x;
+    const uint8_t* srow = src + (size_t)y * sstep;
+    const int N = R_THREADS + 6;
+
+    for (int i = tid; i < N; i += R_THREADS) {
+        int x = x0 - 3 + i;
+        if (x < 0)  x = -x;
+        if (x >= W) x = 2 * W - 2 - x;
+        x = max(0, min(W - 1, x));
+        tile7[i] = srow[x];
+    }
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    const unsigned acc = 2u * tile7[tid] + 7u * tile7[tid + 1] + 14u * tile7[tid + 2] +
+                         18u * tile7[tid + 3] + 14u * tile7[tid + 4] + 7u * tile7[tid + 5] +
+                         2u * tile7[tid + 6];
+    dst[(size_t)y * (dstep >> 1) + x] = (uint16_t)acc;
+}
+
+__global__ void gauss7_cols_u16_kernel(const uint16_t* __restrict__ src, size_t sstep,   // sstep 字节
+                                       uint8_t* __restrict__ dst, size_t dstep,
+                                       int W, int H, int rpt)
+{
+    extern __shared__ uint16_t ring7[];           // 7 * C_THREADS
+    const int tid = threadIdx.x;
+    const int x = blockIdx.x * C_THREADS + tid;
+    if (x >= W) return;
+
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    const size_t srows = sstep >> 1;
+    const uint16_t* scol = src + x;
+    uint16_t* col = ring7 + tid;
+
+    auto fetch = [=](int r) -> uint16_t {
+        int rr = r;
+        if (rr < 0)  rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol[(size_t)rr * srows];
+    };
+
+    for (int j = 0; j < 7; ++j) col[j * C_THREADS] = fetch(j - 3 + y0);
+    int oldest = 0;
+
+    for (int r = y0; r < y1; ++r) {
+        unsigned acc = 0;
+        int slot = oldest;
+#pragma unroll
+        for (int j = 0; j < 7; ++j) {
+            constexpr unsigned iw7[7] = { 2u, 7u, 14u, 18u, 14u, 7u, 2u };
+            acc += iw7[j] * col[slot * C_THREADS];
+            if (++slot == 7) slot = 0;
+        }
+        // 总缩放 64*64=4096（2 的幂），acc ≤ 64*16320 < 2^21，float 精确；与 OpenCV 逐位一致
+        const int v = __float2int_rn((float)acc * (1.f / 4096.f));
+        dst[(size_t)r * dstep + x] = (uint8_t)max(0, min(255, v));
+        if (r + 1 < y1) {
+            col[oldest * C_THREADS] = fetch(r + 1 + 3);
+            if (++oldest == 7) oldest = 0;
+        }
+    }
+}
+
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
 void* ws_grow(size_t need) {
@@ -257,6 +338,29 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
             const int smem = 5 * C_THREADS * (int)sizeof(uint16_t);
             dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
             gauss5_cols_u16_kernel<<<g, t, smem, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                           width, height, rpt);
+        }
+        return;
+    }
+
+    // k=7 固定核 [2,7,14,18,14,7,2]/64（sigma<=0）走 u16 定点 tmp：带宽 10B/px → 6B/px，
+    // 结果与 OpenCV 逐位一致（行和精确 + 列 float MAC 同序，见 kernel 注释）
+    if (ksize == 7 && sigma <= 0.f) {
+        float hw7[MAX_K];
+        make_gauss_kernel(7, sigma, hw7);       // 固定核表，float 权重为精确二进分数
+        CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw7, sizeof(float) * 7, 0, cudaMemcpyHostToDevice, stream));
+
+        const size_t tstep = (size_t)width * 2;
+        uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
+        {
+            const int smem = R_THREADS + 6;
+            dim3 g(idiv_up(width, R_THREADS), height), t(R_THREADS);
+            gauss7_rows_u16_kernel<<<g, t, smem, stream>>>(d_src, srcStep, tmp, tstep, width);
+        }
+        {
+            const int smem = 7 * C_THREADS * (int)sizeof(uint16_t);
+            dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
+            gauss7_cols_u16_kernel<<<g, t, smem, stream>>>(tmp, tstep, d_dst, dstStep,
                                                            width, height, rpt);
         }
         return;

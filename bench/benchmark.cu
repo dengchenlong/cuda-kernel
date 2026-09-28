@@ -143,7 +143,7 @@ int main(int argc, char** argv)
         }
 
         // ---------- 高斯 ----------
-        for (int k : {5, 15}) {
+        for (int k : {5, 7, 15}) {
             auto f = cvo::createGaussianFilter(CV_8UC1, CV_8UC1, cv::Size(k, k), 0, 0);
             double cvms = tm.run([&] { f->apply(dGray, dOutCV); }, warmup, reps);
             double mine = tm.run([&] { gpu_gaussian(b.u8, b.u8step, b.u8, b.u8step, W, H, k, 0.f); }, warmup, reps);

@@ -125,7 +125,7 @@ int main()
         }
 
         // ---------- 高斯 ----------
-        for (int k : {5, 15}) {
+        for (int k : {5, 7, 15}) {
             auto f = cvo::createGaussianFilter(CV_8UC1, CV_8UC1, cv::Size(k, k), 0, 0);
             f->apply(dGray, dOutCV);
             cv::Mat ref; dOutCV.download(ref);

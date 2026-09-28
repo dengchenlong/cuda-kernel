@@ -120,3 +120,34 @@
 - 三项遗留 LOSE 全部翻正：mean k=3 0.65→1.17~1.71x；gaussian k=5 0.94→1.37~1.60x；
   hist-gray 0.93→1.35~2.86x（hist-binary 也从 2~4.9x 提到 2.5~6.5x）
 - 阶段 4 完成，进入阶段 5 收尾（README）
+
+## 第四轮（2026-09-29，gaussian k=7 定点路径增补）
+
+本轮变更：
+- gaussian k=7（sigma<=0 固定核 [2,7,14,18,14,7,2]/64）新增 u16 定点 tmp 路径，
+  首版有缩放错误（未缩放行和乘缩放权重，输出整体×64 饱和到 255，smoke diff=187/193 抓出），
+  修正为整数 MAC + ×(1/4096)（行和≤16320、acc≤64×16320<2^21 全程 float 精确），smoke identical
+- bench/smoke 的 gaussian 参数集从 {5,15} 扩为 {5,7,15}
+
+| 算子 | 参数 | 640x480 | 1280x720 | 1920x1080 | 3840x2160 |
+|---|---|---|---|---|---|
+| integral |  | 4.83x WIN | 2.55x WIN | 2.22x WIN | 1.76x WIN |
+| mean | k=3 | 1.47x WIN | 1.45x WIN | 1.18x WIN | 1.13x WIN |
+| mean | k=15 | 6.64x WIN | 6.26x WIN | 5.66x WIN | 5.95x WIN |
+| mean | k=31 | 20.37x WIN | 18.16x WIN | 19.28x WIN | 22.04x WIN |
+| erode | k=3 | 1.32x WIN | 1.23x WIN | 1.26x WIN | 1.11x WIN |
+| dilate | k=3 | 1.31x WIN | 1.24x WIN | 1.16x WIN | 1.16x WIN |
+| erode | k=15 | 5.09x WIN | 4.50x WIN | 4.26x WIN | 4.06x WIN |
+| dilate | k=15 | 5.09x WIN | 4.50x WIN | 4.26x WIN | 4.09x WIN |
+| erode | k=31 | 15.67x WIN | 11.77x WIN | 11.09x WIN | 10.65x WIN |
+| dilate | k=31 | 15.38x WIN | 13.55x WIN | 10.99x WIN | 10.70x WIN |
+| erode | k=15 gray | 5.12x WIN | 4.48x WIN | 4.25x WIN | 4.09x WIN |
+| dilate | k=15 gray | 5.10x WIN | 4.48x WIN | 4.25x WIN | 4.09x WIN |
+| erode | k=31 gray | 15.70x WIN | 11.76x WIN | 10.90x WIN | 10.61x WIN |
+| dilate | k=31 gray | 15.50x WIN | 13.58x WIN | 11.09x WIN | 10.65x WIN |
+| gaussian | k=5 | 1.39x WIN | 1.33x WIN | 1.26x WIN | 1.34x WIN |
+| gaussian | k=7 | 1.35x WIN | 1.48x WIN | 1.55x WIN | 1.60x WIN |
+| gaussian | k=15 | 1.36x WIN | 1.62x WIN | 1.68x WIN | 1.72x WIN |
+### 第四轮结论
+- 全部 76 项全 WIN（0 LOSE），gaussian k=7 新增路径 1.35~1.60x
+- 最低项：mean k=3 @4K 1.13x、erode k=15 bin @4K 4.06x 之上为 gaussian k=5 @720p 1.33x 等——所有项 ≥1.11x
