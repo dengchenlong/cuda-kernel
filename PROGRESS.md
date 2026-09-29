@@ -87,6 +87,11 @@ G:\cuda-kernel
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
       的补充核（如 hist 非 16 倍数宽度的向量化、k=7 高斯定点路径、CV_32F 输入格式），非必需
+- [x] 增补（2026-09-30）：histogram 任意宽度向量化路径（W 非 16 倍数/不对齐的 hist_vec_lastblock_kernel，
+      头尾标量 + uint4 主体合并读 + per-warp 私有 hist + last-block 归约），替代旧纯标量回退。
+      调试修两坑：lane 分工致 8 warp ×8 重复计数（probe_hfix11）；对齐偏移 a 未 clamp 到 W 越界读
+      （probe_hfix12）。probe_hfix14 280 用例全过、smoke 全绿；任意宽度 vs OpenCV 1.4~3.2x，
+      vs 旧标量 1.1~1.2x（见 BENCHMARK.md 第五轮）。commit 1167707。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
