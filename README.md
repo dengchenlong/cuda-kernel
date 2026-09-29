@@ -62,6 +62,10 @@ gpu_histogram_binary(d_src, srcStep, W, H, d_hist);   // 同上（bin0=0 的个�
 - **直方图基准必须用真随机数据**：等值/平台数据令 warp 内多 lane 落同一 bin、smem 原子串行化，假慢 4~5 倍。
 - **隐形固定开销优先于微优化**：直方图计时内的 `cudaMemsetAsync` 预清零固定 ~20us，比 1080p 本体（~50us）还贵；
   last-block 归约（partials 普通写 + atomicInc 回绕 + 末块覆写输出）同时消掉了它和全局原子。
+- **block 内线程分工用 threadIdx.x 而非 lane**：按 lane（threadIdx.x & 31）分工时每个 warp
+  都会处理同一批数据 → 8 warp = ×8 计数翻倍（probe_hfix11）；lane 只该用于 warp 内通信。
+- **对齐切分的偏移必须 clamp 到 W**：行基址 16B 对齐修正量 a 在窄行（a > W）时会让头部读取
+  越界到 padding（probe_hfix12），a = min(a, W) 后整行走头尾标量。
 - **小核别套两遍分离**：k=3 均值两遍法的 tmp 往返 4B/px 是大头，单遍 smem 直加 ~2B/px 快 1.5 倍。
 - **定点整数可替代 float 中间缓冲**：dyadic 核（[1,4,6,4,1]/16）下 OpenCV 的 CV_32F 管线全程无舍入，
   整数路径（u16 tmp）逐位一致且带宽减半。

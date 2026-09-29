@@ -151,3 +151,29 @@
 ### 第四轮结论
 - 全部 76 项全 WIN（0 LOSE），gaussian k=7 新增路径 1.35~1.60x
 - 最低项：mean k=3 @4K 1.13x、erode k=15 bin @4K 4.06x 之上为 gaussian k=5 @720p 1.33x 等——所有项 ≥1.11x
+
+## 第五轮（2026-09-30，histogram 任意宽度向量化路径 —— 非 benchmark 主路径补强）
+
+本轮变更（bench/ 主口径 16 倍数宽度路径零改动，仍走 hist_lastblock_kernel）：
+- 原 W 非 16 倍数/不对齐时的回退是纯标量 kernel（每字节 1 次 smem 原子，无合并读）。
+  新增 hist_vec_lastblock_kernel：每行按行基址对齐切 头部标量(≤15B) + uint4 主体（行内
+  16B 对齐合并读）+ 尾部标量(≤15B)，同样 per-warp 私有 hist + last-block 归约。
+- 调试过程（build/probe_hfix1~14）抓出两个经典错误，均已修复并写进 README 踩坑：
+  1. 线程分工误用 lane（threadIdx.x & 31）：8 个 warp 全部处理同一行同一批字节 →
+     计数 ×8（probe_hfix11 复现），修正为 threadIdx.x 分工（跨 warp 唯一）。
+  2. 对齐修正量 a 未 clamp 到 W：窄行（a > W）头部读越界到 padding（probe_hfix12
+     在 W<16、step=W+3 组合复现），修正 a = min(a, W) 整行走头尾。
+- probe_hfix14（280 用例：W 1..80 × 3 种 step、大尺寸 × 4 种 padding）全过；
+  smoke 4 尺寸全绿；bench_histvec 实测新路径 vs OpenCV：
+
+| 尺寸（非 16 倍数宽度） | vec (ms) | 旧标量 (ms) | OpenCV (ms) | vec/cv |
+|---|---|---|---|---|
+| 3840x2160 | 0.129 | 0.158 | 0.180 | 1.40x |
+| 1920x1080 | 0.045 | 0.060 | 0.095 | 2.11x |
+| 1279x719 | 0.033 | 0.035 | 0.081 | 2.48x |
+| 641x479 | 0.026 | 0.024 | 0.065 | 2.54x |
+| 1000x1000 | 0.038 | 0.045 | 0.082 | 2.16x |
+| 321x200 | 0.020 | 0.018 | 0.063 | 3.21x |
+
+- 任意宽度路径相对旧标量回退提速 1.1~1.2x（4K/1080p），vs OpenCV 1.4~3.2x 全 WIN；
+  小图（≤0.03ms）固定开销主导，vec 与标量在噪声内。

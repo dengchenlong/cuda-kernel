@@ -5,6 +5,8 @@
 //   - 因此调用前**无需清零 d_hist**（旧版靠 cudaMemsetAsync 预清零，实测在计时内
 //     固定多花 ~20us —— 比直方图本体还贵，是 benchmark 口径里的隐形大头）。
 //   - counter 用 atomicInc 回绕归零，同一 stream 连续调用安全（与 static workspace 同约束）。
+// 任意宽度/步长：通用向量化 kernel（每行分段：头部标量 ≤15B | uint4 主体 | 尾部标量 ≤15B），
+// W 为 16 倍数且步长对齐时仍走上面的 fast path（benchmark 主路径零改动）。
 // 二值版(0/255)：popcount 直数，同样 last-block 归约，输出全 256 bin（非 0/255 bin 恒 0）。
 #include "ops.h"
 
@@ -68,7 +70,68 @@ __global__ void hist_lastblock_kernel(const uint8_t* __restrict__ src, size_t ss
     }
 }
 
-// ---------- 标量回退（W 非 16 倍数或不对齐）：per-warp 私有 hist + last-block 归约 ----------
+// ---------- 通用向量化（任意宽度/步长）：头尾标量 + uint4 主体，per-warp 私有 hist + last-block 归约 ----------
+// W 非 16 倍数或步长不对齐时替代原标量回退：每行按 (row 基址 & 15) 切成
+// 头部标量(≤15B) + uint4 主体（行内 16B 对齐，天然合并）+ 尾部标量(≤15B)。
+// 行间起始对齐不同 → a 每行重算；a 必须 clamp 到 W（窄行整行走头尾，否则越界读 padding）。
+// 线程分工用 threadIdx.x（跨 warp 唯一，8 个 warp 合力覆盖），勿用 lane —— lane 会让
+// 8 个 warp 重复统计同一行同一批字节（probe_hfix11 实测 ×8 计数翻倍）。
+__global__ void hist_vec_lastblock_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                          int W, int H, int* __restrict__ d_hist,
+                                          int* __restrict__ partials, unsigned* __restrict__ counter)
+{
+    __shared__ int whist[HIST_THREADS / 32][256];
+    __shared__ bool amLast;
+#pragma unroll
+    for (int i = threadIdx.x; i < (HIST_THREADS / 32) * 256; i += HIST_THREADS)
+        whist[i / 256][i % 256] = 0;
+    __syncthreads();
+    int* myh = whist[threadIdx.x >> 5];
+    const int tid = threadIdx.x;
+
+    for (int y = blockIdx.x; y < H; y += gridDim.x) {
+        const uint8_t* row = src + (size_t)y * sstep;
+        // 本行 16B 对齐主体：[a, a + n4*16)，a clamp 到 W（窄行/错位行整行走头尾）
+        int a = (int)((16 - (reinterpret_cast<uintptr_t>(row) & 15)) & 15);
+        if (a > W) a = W;
+        const int n4 = (W - a) >> 4;
+        const int tail0 = a + (n4 << 4);
+        // 头部 [0, a)：tid 小的线程各取 1 字节
+        if (tid < a) atomicAdd(&myh[row[tid]], 1);
+        // uint4 主体：每线程 1 个 uint4，步进 256（W ≤ 4096 时 n4 ≤ 256，仅前 n4 线程各干 1 次）
+        for (int x = tid; x < n4; x += HIST_THREADS) {
+            const uint4 v = ((const uint4*)(row + a))[x];
+            const unsigned w[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+#pragma unroll
+                for (int b = 0; b < 32; b += 8)
+                    atomicAdd(&myh[(w[u] >> b) & 0xff], 1);
+        }
+        // 尾部 [tail0, W)：tid 小的线程各取 1 字节
+        const int tn = W - tail0;
+        if (tid < tn) atomicAdd(&myh[row[tail0 + tid]], 1);
+    }
+    __syncthreads();
+    int s = 0;
+#pragma unroll
+    for (int wq = 0; wq < HIST_THREADS / 32; ++wq) s += whist[wq][threadIdx.x];
+    int* myp = partials + blockIdx.x * 256;
+    myp[threadIdx.x] = s;
+    __threadfence();
+    if (threadIdx.x == 0) {
+        const unsigned ticket = atomicInc(counter, gridDim.x - 1);
+        amLast = (ticket == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (amLast) {
+        int t = 0;
+        for (int b = 0; b < (int)gridDim.x; ++b) t += partials[b * 256 + threadIdx.x];
+        d_hist[threadIdx.x] = t;
+    }
+}
+
+// ---------- 标量回退（兜底，当前无调用方）：per-warp 私有 hist + last-block 归约 ----------
 __global__ void hist_scalar_lastblock_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                              int W, int H, int* __restrict__ d_hist,
                                              int* __restrict__ partials, unsigned* __restrict__ counter)
@@ -203,7 +266,7 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
         hist_lastblock_kernel<<<HIST_GRID, t, 0, stream>>>(d_src, srcStep, width, height,
                                                            d_hist, ws().partials, ws().counter);
     } else {
-        hist_scalar_lastblock_kernel<<<HIST_GRID, HIST_THREADS, 0, stream>>>(
+        hist_vec_lastblock_kernel<<<HIST_GRID, HIST_THREADS, 0, stream>>>(
             d_src, srcStep, width, height, d_hist, ws().partials, ws().counter);
     }
 }
