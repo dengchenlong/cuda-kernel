@@ -55,11 +55,8 @@ G:\cuda-kernel
 ## 当前下一步（cron 续作从这里接）
 - [x] 环境搭建完成：VS2022BT v143 (cl 19.44) 装在 D:\VS2022BuildTools；ninja 用 VS 内置
 - [x] 算子代码初版全部写完并 nvcc 编译通过（utf-8 BOM 必须，nvcc 加 -Xcompiler "/utf-8 /W3"）
-- [ ] OpenCV-CUDA 基准库编译中：后台脚本 D:\deps\build_opencv_cuda.bat → D:\opencv-cuda-build
-       （前两次失败原因：① 未加 WITH_CUDA=ON ② contrib cudev 缺失，已修正，含 contrib 路径 G:\opencv_contrib）
-       编完检查 D:\opencv-cuda-build\install\x64\vc17\bin\ 应有 opencv_cuda*.dll
-- [ ] 编译 smoke + benchmark（需要 OpenCV lib 就绪）：nvcc 命令参考 D:\deps\compile_gpuops.bat，
-       链接加 -L"D:/opencv-cuda-build/install/x64/vc17/lib" -lopencv_core4130 -lopencv_imgproc4130 -lopencv_cudaarithm4130 -lopencv_cudafilters4130 -lopencv_cudaimgproc4130 -lopencv_cudawarping4130，运行时 PATH 加 install\x64\vc17\bin
+- [x] OpenCV-CUDA 基准库编译完成（D:\opencv-cuda-build\install\x64\vc17\，含 opencv_cuda*.dll，2026-09-26 起 smoke/benchmark 全部依赖它运行）
+- [x] 编译 smoke + benchmark 完成（CMake 全目标 build\smoke.exe / build\benchmark.exe，运行时 PATH 加 install\x64\vc17\bin）
 - [x] 跑 smoke 修正确性：全部通过（integral/morph 全核全图 identical；gauss k=5/15 identical；hist identical；mean 残差 ≤1 舍入差异，smoke 容忍 md<=1）
 - [x] 跑 benchmark 记录首轮数字进 BENCHMARK.md（2026-09-26 全尺寸全算子，见 BENCHMARK.md 表格）
 - [x] 优化第一轮（2026-09-27 全部落地，smoke 全绿，BENCHMARK.md 已更新第二轮表格）：
@@ -93,6 +90,8 @@ G:\cuda-kernel
       （probe_hfix12）。probe_hfix14 280 用例全过、smoke 全绿；任意宽度 vs OpenCV 1.4~3.2x，
       vs 旧标量 1.1~1.2x（见 BENCHMARK.md 第五轮）。commit 1167707。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
+- 状态（2026-10-09）：项目必需项全部完成并长期稳定。唯一剩余可选项为 CV_32F 输入格式支持——按原决策属
+  「需明确需求再决定是否启动」，cron 续作在无人确认需求前不自行启动，只做周期性健康巡检（smoke + benchmark）确认无回退。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突
