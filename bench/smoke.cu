@@ -170,6 +170,108 @@ int main()
             if (md) ++g_fail;
             cudaFree(dMine);
         }
+
+        // ---------- CV_32F 输入格式 ----------
+        {
+            cv::Mat grayF(H, W, CV_32FC1);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    grayF.at<float>(y, x) = (float)gray.at<uchar>(y, x);
+            cvo::GpuMat dGrayF(grayF), dOutF;
+            cv::Mat refF, mineF(H, W, CV_32FC1);
+            float* dMineF; size_t mfstep;
+            CUDA_CHECK(cudaMallocPitch(&dMineF, &mfstep, (size_t)W * 4, H));
+
+            // 积分图 f32→f32：OpenCV CUDA integral 不支持 32F；CPU cv::integral 内部用 double
+            // 累加器（probe_int_f32b 证实 float 模拟与其差 1.79e4 @65x49），非同构。
+            // 参照改为 float 模拟（行 float 前缀 + 列 float 前缀，与 kernel 语义一致），要求逐位一致
+            {
+                cv::Mat simF(H, W, CV_32FC1);
+                for (int y = 0; y < H; ++y) {
+                    float run = 0.f;
+                    for (int x = 0; x < W; ++x) {
+                        run += grayF.at<float>(y, x);
+                        simF.at<float>(y, x) = run;
+                    }
+                }
+                for (int x = 0; x < W; ++x) {
+                    float run = 0.f;
+                    for (int y = 0; y < H; ++y) {
+                        run += simF.at<float>(y, x);
+                        simF.at<float>(y, x) = run;
+                    }
+                }
+                refF = simF;
+            }
+            gpu_integral_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H);
+            CUDA_CHECK(cudaMemcpy2D(mineF.data, mineF.step, dMineF, mfstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
+            {
+                // 语义 = 行 float 前缀 + 列 float 前缀，与参照 float 模拟逐位一致（不容差）
+                double md = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x)
+                        md = std::max(md, std::fabs((double)mineF.at<float>(y, x) - (double)refF.at<float>(y, x)));
+                const bool ok = md == 0.0;
+                printf("  [%s] integral f32: max diff = %.4g\n", ok ? "OK" : "FAIL", md);
+                if (!ok) ++g_fail;
+            }
+
+            // 均值 f32
+            for (int k : {3, 15, 31}) {
+                auto f = cvo::createBoxFilter(CV_32FC1, CV_32FC1, cv::Size(k, k), cv::Point(-1, -1));
+                f->apply(dGrayF, dOutF);
+                dOutF.download(refF);
+                gpu_mean_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                CUDA_CHECK(cudaMemcpy2D(mineF.data, mineF.step, dMineF, mfstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
+                double md = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x)
+                        md = std::max(md, (double)std::fabs(mineF.at<float>(y, x) - refF.at<float>(y, x)));
+                const bool ok = md <= 1e-2;
+                printf("  [%s] mean f32 k=%d: max diff = %.4g\n", ok ? "OK" : "FAIL", k, md);
+                if (!ok) ++g_fail;
+            }
+
+            // 形态学 f32（min/max 逐位一致，不容差）
+            for (int k : {3, 15, 31}) {
+                cv::Mat ker = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
+                auto fe = cvo::createMorphologyFilter(cv::MORPH_ERODE, CV_32FC1, ker);
+                auto fd = cvo::createMorphologyFilter(cv::MORPH_DILATE, CV_32FC1, ker);
+                for (int opn = 0; opn < 2; ++opn) {
+                    if (opn == 0) fe->apply(dGrayF, dOutF);
+                    else          fd->apply(dGrayF, dOutF);
+                    dOutF.download(refF);
+                    if (opn == 0) gpu_erode_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                    else          gpu_dilate_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                    CUDA_CHECK(cudaMemcpy2D(mineF.data, mineF.step, dMineF, mfstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
+                    double md = 0;
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x)
+                            md = std::max(md, (double)std::fabs(mineF.at<float>(y, x) - refF.at<float>(y, x)));
+                    char name[40]; snprintf(name, 40, "%s f32 k=%d", opn ? "dilate" : "erode", k);
+                    const bool ok = md == 0.0;
+                    printf("  [%s] %s: max diff = %.4g\n", ok ? "OK" : "FAIL", name, md);
+                    if (!ok) ++g_fail;
+                }
+            }
+
+            // 高斯 f32（MAC 次序差异，容差 1e-2）
+            for (int k : {5, 15}) {
+                auto f = cvo::createGaussianFilter(CV_32FC1, CV_32FC1, cv::Size(k, k), 0, 0);
+                f->apply(dGrayF, dOutF);
+                dOutF.download(refF);
+                gpu_gaussian_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, 0.f);
+                CUDA_CHECK(cudaMemcpy2D(mineF.data, mineF.step, dMineF, mfstep, (size_t)W * 4, H, cudaMemcpyDeviceToHost));
+                double md = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x)
+                        md = std::max(md, (double)std::fabs(mineF.at<float>(y, x) - refF.at<float>(y, x)));
+                const bool ok = md <= 1e-2;
+                printf("  [%s] gauss f32 k=%d: max diff = %.4g\n", ok ? "OK" : "FAIL", k, md);
+                if (!ok) ++g_fail;
+            }
+            cudaFree(dMineF);
+        }
     }
 
     printf(g_fail ? "\nSMOKE: %d problem(s)\n" : "\nSMOKE: all pass (%d flagged)\n", g_fail);

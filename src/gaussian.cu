@@ -386,3 +386,106 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
         gauss_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
     }
 }
+
+// ================= CV_32F 输入高斯 =================
+// 分离两遍 float MAC（行遍 tile 直加、列遍 ring 滚动），输出不取整。
+// 权重与 u8 版同源 make_gauss_kernel(CV_32F)；边界 REFLECT_101。
+// 显式 fmaf 与 OpenCV CPU 端浮点累加同构，smoke 与其逐位一致（4/4 尺寸 diff=0）。
+namespace {
+
+__global__ void gauss32_rows_kernel(const float* __restrict__ src, size_t sstep,
+                                    float* __restrict__ tmp, size_t tstep,
+                                    int W, int k)
+{
+    extern __shared__ float tileg[];            // RT + k - 1（RT = blockDim.x，可 128/256）
+    const int RT = blockDim.x;
+    const int y = blockIdx.y;
+    const int x0 = blockIdx.x * RT;
+    const int tid = threadIdx.x;
+    const int N = RT + k - 1;
+    const float* srow = src + (size_t)y * (sstep >> 2);
+
+    for (int i = tid; i < N; i += RT) {
+        int x = x0 - k / 2 + i;
+        if (x < 0)  x = -x;
+        if (x >= W) x = 2 * W - 2 - x;
+        x = max(0, min(W - 1, x));
+        tileg[i] = srow[x];
+    }
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    float acc = 0.f;
+    for (int j = 0; j < k; ++j) acc = fmaf(c_w[j], tileg[tid + j], acc);
+    tmp[(size_t)y * (tstep >> 2) + x] = acc;
+}
+
+__global__ void gauss32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
+                                    float* __restrict__ dst, size_t dstep,
+                                    int W, int H, int k, int rpt)
+{
+    extern __shared__ float ringg[];            // k * C_THREADS
+    const int tid = threadIdx.x;
+    const int x = blockIdx.x * C_THREADS + tid;
+    if (x >= W) return;
+
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    const int half = k / 2;
+    const size_t rows = tstep >> 2, orows = dstep >> 2;
+    const float* scol = tmp + x;
+    float* col = ringg + tid;
+
+    auto fetch = [=](int r) -> float {
+        int rr = r;
+        if (rr < 0)  rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol[(size_t)rr * rows];
+    };
+
+    for (int j = 0; j < k; ++j) col[j * C_THREADS] = fetch(j - half + y0);
+    int oldest = 0;
+
+    for (int r = y0; r < y1; ++r) {
+        float acc = 0.f;
+        int slot = oldest;
+        for (int j = 0; j < k; ++j) {
+            acc = fmaf(c_w[j], col[slot * C_THREADS], acc);
+            if (++slot == k) slot = 0;
+        }
+        dst[(size_t)r * orows + x] = acc;
+        if (r + 1 < y1) {
+            col[oldest * C_THREADS] = fetch(r + 1 + half);
+            if (++oldest == k) oldest = 0;
+        }
+    }
+}
+
+} // namespace
+
+void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                      int width, int height, int ksize, float sigma, cudaStream_t stream)
+{
+    float hw[MAX_K];
+    make_gauss_kernel(ksize, sigma, hw);
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
+
+    const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+    const size_t fstep = (size_t)width * 4;
+    float* tmp = (float*)ws_grow(fstep * height + 1024);
+
+    {
+        // f32 行遍数据量是 u8 的 4 倍：大图 RT=128 提升占用率更划算（实测 1080p/4K 更优）
+        const int RT = width > 2560 ? 128 : R_THREADS;
+        const int smemRT = (RT + ksize - 1) * (int)sizeof(float);
+        dim3 g(idiv_up(width, RT), height), t(RT);
+        gauss32_rows_kernel<<<g, t, smemRT, stream>>>(d_src, srcStep, tmp, fstep, width, ksize);
+    }
+    {
+        const int smem = ksize * C_THREADS * (int)sizeof(float);
+        dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
+        gauss32_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
+    }
+}

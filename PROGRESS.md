@@ -80,6 +80,19 @@ G:\cuda-kernel
 - [x] 增补（2026-09-29）：gaussian k=7 定点整数路径（sigma<=0），弃错误的首版（未缩放行和×
       缩放权重=输出×64 饱和），改整数 MAC + ×(1/4096)，smoke identical；bench 加 k=7 列，
       全尺寸 1.35~1.60x WIN，BENCHMARK.md 第四轮
+- [x] CV_32F 输入格式支持（2026-10-09，gpu_integral_f32 / gpu_mean_f32 / gpu_erode_f32 /
+      gpu_dilate_f32 / gpu_gaussian_f32）：
+      - integral f32：OpenCV-CUDA 无此 API（cuda::integral 仅 8UC1），参照用 float 模拟
+        （行前缀+列前缀，CPU cv::integral 是 double 累加器，语义不同见 probe_int_f32b），
+        kernel 逐位一致
+      - mean f32：分离两遍（行 tile 前缀和 + 列滑动），与 OpenCV boxFilter(CV_32FC1) 差
+        ~1.5e-5（其内部累加序不同），WIN 1.25~19x（大核优势极大）
+      - morph f32：两遍直加；第一版列遍原地读写 dst 有 block 间竞态（smoke diff≈100+ 抓出），
+        修正为读 tmp；与 OpenCV f32 形态学逐位一致，WIN 2.2~12.9x
+      - gauss f32：显式 fmaf 后与 OpenCV 逐位一致；RT 大图 128 占用率更高；
+        720p k=5 偶发 0.97x（±3% 计时噪声），其余全 WIN（1.0~1.8x）
+      - smoke 新增 f32 全算子组（all pass），bench 新增 f32 组 22 项（119 WIN / 1 噪声 lose）
+- 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径

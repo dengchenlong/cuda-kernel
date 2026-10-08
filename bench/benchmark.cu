@@ -150,6 +150,55 @@ int main(int argc, char** argv)
             report("gaussian", W, H, "k=" + std::to_string(k), mine, cvms);
         }
 
+        // ---------- CV_32F 输入 ----------
+        {
+            cv::Mat grayF(H, W, CV_32FC1);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    grayF.at<float>(y, x) = (float)gray.at<uchar>(y, x);
+            cvo::GpuMat dGrayF(grayF), dOutF;
+            float* dMineF; size_t mfstep;
+            CUDA_CHECK(cudaMallocPitch(&dMineF, &mfstep, (size_t)W * 4, H));
+
+            // 注：OpenCV-CUDA 没有 f32 积分图（cuda::integral 仅支持 CV_8UC1），无法同卡对照，
+            // integral-f32 不进对照表；均值/形态学/高斯的 f32 均可对照。
+            double cvms = 0.0, mine = 0.0;
+
+            for (int k : {3, 15, 31}) {
+                auto f = cvo::createBoxFilter(CV_32FC1, CV_32FC1, cv::Size(k, k), cv::Point(-1, -1));
+                cvms = tm.run([&] { f->apply(dGrayF, dOutF); }, warmup, reps);
+                mine = tm.run([&] {
+                    gpu_mean_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                }, warmup, reps);
+                report("mean-f32", W, H, "k=" + std::to_string(k), mine, cvms);
+            }
+            for (int k : {3, 15, 31}) {
+                cv::Mat ker = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
+                auto fe = cvo::createMorphologyFilter(cv::MORPH_ERODE, CV_32FC1, ker);
+                auto fd = cvo::createMorphologyFilter(cv::MORPH_DILATE, CV_32FC1, ker);
+                double cve = tm.run([&] { fe->apply(dGrayF, dOutF); }, warmup, reps);
+                double cvd = tm.run([&] { fd->apply(dGrayF, dOutF); }, warmup, reps);
+                double me = tm.run([&] {
+                    gpu_erode_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                }, warmup, reps);
+                double md = tm.run([&] {
+                    gpu_dilate_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, k);
+                }, warmup, reps);
+                char p[16]; snprintf(p, 16, "k=%d", k);
+                report("erode-f32", W, H, p, me, cve);
+                report("dilate-f32", W, H, p, md, cvd);
+            }
+            for (int k : {5, 15}) {
+                auto f = cvo::createGaussianFilter(CV_32FC1, CV_32FC1, cv::Size(k, k), 0, 0);
+                cvms = tm.run([&] { f->apply(dGrayF, dOutF); }, warmup, reps);
+                mine = tm.run([&] {
+                    gpu_gaussian_f32((const float*)dGrayF.data, dGrayF.step, dMineF, mfstep, W, H, k, 0.f);
+                }, warmup, reps);
+                report("gaussian-f32", W, H, "k=" + std::to_string(k), mine, cvms);
+            }
+            cudaFree(dMineF);
+        }
+
         // ---------- 直方图 ----------
         {
             // 关键：前面形态学/均值测试把 b.u8 原地写成了大片等值平台区（opening 效应），

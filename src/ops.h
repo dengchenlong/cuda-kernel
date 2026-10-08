@@ -44,3 +44,22 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
 // 调用前无需清零
 void gpu_histogram_binary(const uint8_t* d_src, size_t srcStep,
                           int width, int height, int* d_hist, cudaStream_t stream = 0);
+
+// ============ CV_32F 输入格式 (CV_32FC1 → CV_32FC1) ============
+// 积分图 f32→f32（行/列均逐元素顺序累加，与 OpenCV cuda::integral 32FC1 路径同构）
+void gpu_integral_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                      int width, int height, cudaStream_t stream = 0);
+
+// 均值滤波 f32（box kw×kh，anchor=中心，BORDER_REFLECT_101，输出为窗口和×1/area 不取整）
+void gpu_mean_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                  int width, int height, int kw, int kh, cudaStream_t stream = 0);
+
+// 腐蚀/膨胀 f32（min/max，边界恒等元 +inf/-inf，与 morphologyDefaultBorderValue 语义一致）
+void gpu_erode_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                   int width, int height, int kw, int kh, cudaStream_t stream = 0);
+void gpu_dilate_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                    int width, int height, int kw, int kh, cudaStream_t stream = 0);
+
+// 高斯 f32（分离两遍 float MAC，输出不取整；权重与 u8 版同源 getGaussianKernel(CV_32F)）
+void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                      int width, int height, int ksize, float sigma, cudaStream_t stream = 0);

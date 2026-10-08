@@ -177,3 +177,40 @@
 
 - 任意宽度路径相对旧标量回退提速 1.1~1.2x（4K/1080p），vs OpenCV 1.4~3.2x 全 WIN；
   小图（≤0.03ms）固定开销主导，vec 与标量在噪声内。
+
+## 第五轮（2026-10-09，CV_32F 输入格式支持）
+
+新增 5 个 f32 算子（integral/mean/morph/gaussian 的 CV_32FC1 进出），bench 增加 f32 组 22 项。
+f32 全部 119 项对照：118 WIN，唯一 lose 是 gaussian-f32 720p k=5 的 0.97x（±3% 计时噪声，
+同参数在其他轮次实测 1.00~1.06x）。morph f32 与 gauss f32 与 OpenCV 逐位一致（diff=0），
+mean f32 差 ~1.5e-5（OpenCV 内部累加序不同），integral f32 无 OpenCV-CUDA 对照
+（cuda::integral 不支持 32F，CPU cv::integral 为 double 累加器语义不同）。
+
+| 算子 | 参数 | 640x480 | 1280x720 | 1920x1080 | 3840x2160 |
+|---|---|---|---|---|---|
+| integral | mine | 11.79x Win | 6.23x Win | 4.40x Win | 2.89x Win |
+| mean | k=3 | 1.95x Win | 1.89x Win | 1.45x Win | 1.25x Win |
+| mean | k=15 | 6.48x Win | 6.02x Win | 5.58x Win | 5.80x Win |
+| mean | k=31 | 17.69x Win | 17.46x Win | 18.73x Win | 21.50x Win |
+| erode | k=3 | 1.54x Win | 1.39x Win | 1.32x Win | 1.24x Win |
+| dilate | k=3 | 1.26x Win | 1.41x Win | 1.29x Win | 1.19x Win |
+| erode | k=15 | 4.74x Win | 4.34x Win | 4.23x Win | 4.09x Win |
+| dilate | k=15 | 4.78x Win | 4.36x Win | 4.23x Win | 4.09x Win |
+| erode | k=31 | 15.07x Win | 13.02x Win | 12.45x Win | 10.53x Win |
+| dilate | k=31 | 14.72x Win | 13.10x Win | 12.36x Win | 12.22x Win |
+| gaussian | k=5 | 1.60x Win | 1.38x Win | 1.38x Win | 1.40x Win |
+| gaussian | k=7 | 1.04x Win | 1.28x Win | 1.53x Win | 1.61x Win |
+| gaussian | k=15 | 1.26x Win | 1.52x Win | 1.57x Win | 1.73x Win |
+| mean-f32 | k=3 | 1.64x Win | 1.62x Win | 1.36x Win | 1.37x Win |
+| mean-f32 | k=15 | 6.05x Win | 8.04x Win | 9.51x Win | 10.19x Win |
+| mean-f32 | k=31 | 11.23x Win | 16.51x Win | 16.94x Win | 19.23x Win |
+| erode-f32 | k=3 | 3.09x Win | 2.83x Win | 2.62x Win | 2.56x Win |
+| dilate-f32 | k=3 | 2.27x Win | 2.59x Win | 2.84x Win | 2.60x Win |
+| erode-f32 | k=15 | 8.27x Win | 9.93x Win | 10.27x Win | 11.59x Win |
+| dilate-f32 | k=15 | 8.33x Win | 10.03x Win | 10.26x Win | 11.62x Win |
+| erode-f32 | k=31 | 12.24x Win | 12.09x Win | 12.44x Win | 11.57x Win |
+| dilate-f32 | k=31 | 12.20x Win | 11.99x Win | 12.47x Win | 11.92x Win |
+| gaussian-f32 | k=5 | 1.04x Win | 0.97x Lose | 1.01x Win | 1.03x Win |
+| gaussian-f32 | k=15 | 1.28x Win | 1.64x Win | 1.59x Win | 1.79x Win |
+| hist-binary | mine | 2.08x Win | 2.60x Win | 4.10x Win | 5.37x Win |
+| hist-gray | mine | 1.50x Win | 1.58x Win | 1.61x Win | 1.59x Win |

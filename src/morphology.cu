@@ -302,3 +302,110 @@ void gpu_dilate(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dst
 {
     morph<MaxOp>(d_src, srcStep, d_dst, dstStep, width, height, kw, kh, stream);
 }
+
+// ================= CV_32F 输入腐蚀/膨胀 =================
+// f32 上 min/max 与 OpenCV 的 f32 形态学逐位一致；边界恒等元（腐蚀 +inf、膨胀 -inf）
+// 等价于窗口 clamp 到图像内（morphologyDefaultBorderValue 语义）。
+// 路线：分离两遍直加窗口（rows O(kW) + cols 行分块 O(kH)），k≤31 覆盖常用场景。
+namespace {
+
+struct MinOpF { __device__ float operator()(float a, float b) const { return fminf(a, b); } static __device__ float ident() { return __int_as_float(0x7f800000); } };
+struct MaxOpF { __device__ float operator()(float a, float b) const { return fmaxf(a, b); } static __device__ float ident() { return __int_as_float(0xff800000); } };
+
+template <typename Op>
+__global__ void morph32_rows_kernel(const float* __restrict__ src, size_t sstep,
+                                    float* __restrict__ dst, size_t dstep,
+                                    int W, int k)
+{
+    __shared__ float tile[512];                 // 256 + k - 1，k ≤ 257
+    const int y   = blockIdx.y;
+    const int x0  = blockIdx.x * 256;
+    const int tid = threadIdx.x;
+    const Op op;
+    const float* srow = src + (size_t)y * (sstep >> 2);
+
+    for (int i = tid; i < 256 + k - 1; i += 256) {
+        const int gx = x0 - k / 2 + i;
+        tile[i] = (gx >= 0 && gx < W) ? srow[gx] : Op::ident();
+    }
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    float v = tile[tid];
+#pragma unroll 4
+    for (int j = 1; j < k; ++j) v = op(v, tile[tid + j]);
+    dst[(size_t)y * (dstep >> 2) + x] = v;
+}
+
+template <typename Op>
+__global__ void morph32_cols_kernel(const float* __restrict__ src, size_t sstep,
+                                    float* __restrict__ dst, size_t dstep,
+                                    int W, int H, int k, int rpt)
+{
+    const int x   = blockIdx.x * 256 + threadIdx.x;
+    const int y0  = blockIdx.y * rpt;
+    const int y1  = min(H, y0 + rpt);
+    const Op op;
+    if (x >= W) return;
+    const size_t rows = sstep >> 2, orows = dstep >> 2;
+
+    auto fetch = [&](int r) -> float {
+        return (r >= 0 && r < H) ? src[(size_t)r * rows + x] : Op::ident();
+    };
+    if (k <= 3) {
+        // k≤3：三寄存器滚动
+        float a = fetch(y0 - 1), b = fetch(y0);
+        for (int r = y0; r < y1; ++r) {
+            const float c = fetch(r + 1);
+            float v = op(a, b);
+            v = op(v, c);
+            dst[(size_t)r * orows + x] = v;
+            a = b; b = c;
+        }
+        return;
+    }
+    // k>3：k 槽 ring（动态下标走 local memory，正确性优先）
+    float ringv[255];
+    for (int j = 0; j < k; ++j) ringv[j] = fetch(j - k / 2 + y0);
+    int oldest = 0;
+    for (int r = y0; r < y1; ++r) {
+        float v = ringv[oldest];
+        for (int j = 1; j < k; ++j) v = op(v, ringv[(oldest + j) % k]);
+        dst[(size_t)r * orows + x] = v;
+        if (r + 1 < y1) {
+            ringv[oldest] = fetch(r + 1 + k / 2);
+            if (++oldest == k) oldest = 0;
+        }
+    }
+}
+
+template <typename Op>
+void morph32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+             int width, int height, int kw, int kh, cudaStream_t stream)
+{
+    // 关键：列遍必须读「行遍的输出」而不是 dst 原地读写 —— 行分块后，上方 chunk 的
+    // 输出行会被下方 chunk 当输入读，block 间无同步 → 竞态（u8 版列遍读 tmp 同理）
+    const size_t tstep = (size_t)width * 4;
+    float* tmp = (float*)ws_grow(tstep * height + 1024);
+    dim3 g1((width + 255) / 256, height), t1(256);
+    morph32_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+    const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+    dim3 g2((width + 255) / 256, (height + rpt - 1) / rpt), t2(256);
+    morph32_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                   width, height, kh, rpt);
+}
+
+} // namespace
+
+void gpu_erode_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                   int width, int height, int kw, int kh, cudaStream_t stream)
+{
+    morph32<MinOpF>(d_src, srcStep, d_dst, dstStep, width, height, kw, kh, stream);
+}
+
+void gpu_dilate_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                    int width, int height, int kw, int kh, cudaStream_t stream)
+{
+    morph32<MaxOpF>(d_src, srcStep, d_dst, dstStep, width, height, kw, kh, stream);
+}

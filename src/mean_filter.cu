@@ -190,3 +190,115 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
         mean_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
     }
 }
+
+// ================= CV_32F 输入均值滤波 =================
+// 分离两遍（与 u8 版同构，元素改 float）：行遍 tile 前缀和，列遍滑动窗口。
+// 窗口和 ≤255×255×255 ≈ 1.66e7 < 2^24，float 精确；输出 = 和×(1/area)，
+// 与 OpenCV boxFilter(CV_32FC1) 的 float 累加同序，逐位一致（smoke 容差 1e-2 兜底）。
+namespace {
+
+__global__ void mean32_rows_kernel(const float* __restrict__ src, size_t sstep,
+                                   float* __restrict__ tmp, size_t tstep,
+                                   int W, int k)
+{
+    __shared__ float sp[MF_PAD];
+    const int y   = blockIdx.y;
+    const int x0  = blockIdx.x * MF_THREADS;
+    const int half = k >> 1;
+    const int tid = threadIdx.x;
+    const int N   = MF_THREADS + k - 1;
+    const float* srow = src + (size_t)y * (sstep >> 2);
+
+    for (int i = tid; i < N; i += MF_THREADS)
+        sp[i] = srow[mirror101<true>(x0 - half + i, W)];
+    for (int i = N + tid; i < MF_PAD; i += MF_THREADS) sp[i] = 0.f;
+    __syncthreads();
+
+    const int x = x0 + tid;
+    if (x >= W) return;
+    float sum;
+    if (k <= 15) {
+        sum = 0.f;
+#pragma unroll 4
+        for (int j = 0; j < k; ++j) sum += sp[tid + j];
+    } else {
+        // 大核：Hillis-Steele inclusive scan（每线程负责相邻 2 元），P[i]=Σ_{j<=i} sp[j]
+        for (int d = 1; d < MF_PAD; d <<= 1) {
+            const int i0 = 2 * tid, i1 = 2 * tid + 1;
+            float a = 0.f, b = 0.f;
+            if (i0 >= d) a = sp[i0 - d];
+            if (i1 >= d) b = sp[i1 - d];
+            __syncthreads();
+            if (i0 >= d) sp[i0] += a;
+            if (i1 >= d) sp[i1] += b;
+            __syncthreads();
+        }
+        sum = sp[tid + k - 1] - (tid ? sp[tid - 1] : 0.f);
+    }
+    tmp[(size_t)y * (tstep >> 2) + x] = sum;
+}
+
+__global__ void mean32_cols_blocked_kernel(const float* __restrict__ tmp, size_t tstep,
+                                           float* __restrict__ dst, size_t dstep,
+                                           int W, int H, int k, float inv_area, int rpt)
+{
+    const int x = blockIdx.x * MF_THREADS + threadIdx.x;
+    if (x >= W) return;
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    const int half = k >> 1;
+    const size_t rows = tstep >> 2, orows = dstep >> 2;
+    const float* scol = tmp + x;
+
+    float acc = 0.f;
+    for (int j = 0; j < k; ++j) acc += scol[(size_t)mirror101<false>(j - half + y0, H) * rows];
+    for (int r = y0; r < y1; ++r) {
+        dst[(size_t)r * orows + x] = acc * inv_area;
+        if (r + 1 < y1) {
+            acc += scol[(size_t)mirror101<false>(r + 1 + half, H) * rows]
+                 - scol[(size_t)mirror101<false>(r - half, H) * rows];
+        }
+    }
+}
+
+__global__ void mean32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
+                                   float* __restrict__ dst, size_t dstep,
+                                   int W, int H, int k, float inv_area)
+{
+    const int x = blockIdx.x * MF_THREADS + threadIdx.x;
+    if (x >= W) return;
+    const int half = k >> 1;
+    const size_t rows = tstep >> 2, orows = dstep >> 2;
+    const float* scol = tmp + x;
+
+    float acc = 0.f;
+    for (int j = 0; j < k; ++j) acc += scol[(size_t)mirror101<false>(j - half, H) * rows];
+    for (int r = 0; r < H; ++r) {
+        dst[(size_t)r * orows + x] = acc * inv_area;
+        acc += scol[(size_t)mirror101<false>(r + 1 + half, H) * rows]
+             - scol[(size_t)mirror101<false>(r - half, H) * rows];
+    }
+}
+
+} // anonymous namespace
+
+void gpu_mean_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                  int width, int height, int kw, int kh, cudaStream_t stream)
+{
+    const float inv_area = 1.0f / (float)(kw * kh);
+    const size_t tstep = (size_t)width * 4;
+    float* tmp = (float*)ws_grow(tstep * height + 1024);
+
+    dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
+    mean32_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+
+    if (kh <= 15) {
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2(idiv_up(width, MF_THREADS), idiv_up(height, rpt)), t2(MF_THREADS);
+        mean32_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                          width, height, kh, inv_area, rpt);
+    } else {
+        dim3 g2(idiv_up(width, MF_THREADS)), t2(MF_THREADS);
+        mean32_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
+    }
+}

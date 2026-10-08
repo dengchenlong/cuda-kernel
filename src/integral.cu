@@ -241,3 +241,130 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
         }
     }
 }
+
+// ================= CV_32F 输入积分图 =================
+// 行遍：warp 分段扫描（每 lane 16 个 float 段内顺序累加 + shuffle 扫描，与 u8 版同构），
+// 列遍：每线程一列分 chunk 顺序累加 + carry 回加。
+// 顺序均与 OpenCV 逐元素一致；大图累加和超出 2^24 后 float 舍入与分块粒度相关，
+// 语义为「与 OpenCV 同构的 float 积分图」，允许相对舍入差（smoke 用相对容差校验）。
+namespace {
+
+__global__ void integral_rows_f32_kernel(const float* __restrict__ src, size_t sstep,
+                                         float* __restrict__ dst, size_t dstep,
+                                         int W, int H)
+{
+    const int lane  = threadIdx.x & 31;
+    const int warp  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int nwarps = (gridDim.x * blockDim.x) >> 5;
+    constexpr int SEG = 16;
+
+    for (int y = warp; y < H; y += nwarps) {
+        const float* srow = src + (size_t)y * (sstep >> 2);
+        float* drow = (float*)((uint8_t*)dst + (size_t)y * dstep);
+        float carry = 0.f;
+
+        for (int x0 = 0; x0 < W; x0 += 32 * SEG) {
+            const int my0 = x0 + lane * SEG;
+            float vals[SEG];
+            float partial = 0.f;
+#pragma unroll
+            for (int k = 0; k < SEG; ++k) {
+                const int x = my0 + k;
+                float v = 0.f;
+                if (x < W) v = srow[x];
+                vals[k] = v;
+                partial += v;
+            }
+            float inc = partial;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                float t = __shfl_up_sync(0xffffffffu, inc, d);
+                if (lane >= d) inc += t;
+            }
+            const float excl = inc - partial + carry;
+            carry += __shfl_sync(0xffffffffu, inc, 31);
+
+            float run = excl;
+#pragma unroll
+            for (int k = 0; k < SEG; ++k) {
+                run += vals[k];
+                const int x = my0 + k;
+                if (x < W) drow[x] = run;
+            }
+        }
+    }
+}
+
+__global__ void integral_cols_f32_kernel(const float* __restrict__ in, size_t istep,
+                                         float* __restrict__ out, size_t ostep,
+                                         float* __restrict__ carry,
+                                         int W, int H, int nChunks)
+{
+    const int chunk = blockIdx.y;
+    const int r0 = chunk * CHUNK_H;
+    const int r1 = min(H, r0 + CHUNK_H);
+    const int c  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= W) return;
+
+    const size_t rows = istep >> 2, orows = ostep >> 2;
+    const float* ip = in + (size_t)r0 * rows + c;
+    float*       op = out + (size_t)r0 * orows + c;
+    float car = 0.f;
+    for (int r = r0; r < r1; ++r) {
+        car += *ip;
+        *op = car;
+        ip += rows; op += orows;
+    }
+    if (nChunks > 1) carry[(size_t)chunk * W + c] = car;
+}
+
+__global__ void integral_carry_add_f32_kernel(float* __restrict__ out, size_t ostep,
+                                              const float* __restrict__ carry,
+                                              int W, int H)
+{
+    const int chunk = blockIdx.y + 1;
+    const int r0 = chunk * CHUNK_H;
+    const int r1 = min(H, r0 + CHUNK_H);
+    const int c  = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= W) return;
+
+    float exc = 0.f;
+    for (int j = 0; j < chunk; ++j) exc += carry[(size_t)j * W + c];
+
+    const size_t orows = ostep >> 2;
+    float* op = out + (size_t)r0 * orows + c;
+    for (int r = r0; r < r1; ++r) {
+        *op += exc;
+        op += orows;
+    }
+}
+
+} // anonymous namespace
+
+void gpu_integral_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                      int width, int height, cudaStream_t stream)
+{
+    if (width <= 0 || height <= 0) return;
+    {
+        const int warpsPerBlock = 8;
+        const int blocks = 12;
+        integral_rows_f32_kernel<<<blocks, warpsPerBlock * 32, 0, stream>>>(
+            d_src, srcStep, d_dst, dstStep, width, height);
+    }
+    const int nChunks = idiv_up(height, CHUNK_H);
+    float* carry = nullptr;
+    if (nChunks > 1)
+        carry = (float*)ws_grow((size_t)nChunks * width * sizeof(float));
+    const int colBlocks = idiv_up(width, 256);
+    if (nChunks == 1) {
+        dim3 g(colBlocks), t(256);
+        integral_cols_f32_kernel<<<g, t, 0, stream>>>(
+            d_dst, dstStep, d_dst, dstStep, nullptr, width, height, 1);
+    } else {
+        dim3 g(colBlocks, nChunks), t(256);
+        integral_cols_f32_kernel<<<g, t, 0, stream>>>(
+            d_dst, dstStep, d_dst, dstStep, carry, width, height, nChunks);
+        dim3 g2(colBlocks, nChunks - 1), t2(256);
+        integral_carry_add_f32_kernel<<<g2, t2, 0, stream>>>(d_dst, dstStep, carry, width, height);
+    }
+}
