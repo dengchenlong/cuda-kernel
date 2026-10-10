@@ -103,8 +103,10 @@ G:\cuda-kernel
       （probe_hfix12）。probe_hfix14 280 用例全过、smoke 全绿；任意宽度 vs OpenCV 1.4~3.2x，
       vs 旧标量 1.1~1.2x（见 BENCHMARK.md 第五轮）。commit 1167707。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
-- 状态（2026-10-09）：项目必需项全部完成并长期稳定。唯一剩余可选项为 CV_32F 输入格式支持——按原决策属
-  「需明确需求再决定是否启动」，cron 续作在无人确认需求前不自行启动，只做周期性健康巡检（smoke + benchmark）确认无回退。
+- 状态（2026-10-10）：项目必需项全部完成。CV_32F 输入格式支持已于 2026-10-09~10 完成（第六/七轮），
+  gaussian-f32 k=5 的遗留 lose 已由两阶段 v2 修复，当前 bench 120 项全 WIN。
+  后续 cron 续作回归周期性健康巡检（smoke + benchmark）确认无回退；除非用户提出新需求（如 CV_32UC1、
+  多通道、非矩形核等），不再自行启动新开发。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突

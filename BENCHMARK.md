@@ -178,6 +178,29 @@
 - 任意宽度路径相对旧标量回退提速 1.1~1.2x（4K/1080p），vs OpenCV 1.4~3.2x 全 WIN；
   小图（≤0.03ms）固定开销主导，vec 与标量在噪声内。
 
+## 第七轮（2026-10-10，gaussian-f32 两阶段 v2 —— 修掉 f32 k=5 的 3 个 lose）
+
+本轮变更（u8 全部路径零改动）：
+- probe_gf32 / probe_gf32b 定位第六轮 gaussian-f32 k=5（0.89~0.97x lose）的瓶颈：
+  - 阶段拆分（probe_gf32）：rows ~0.95ms + cols ~0.81ms @4K（合计 1.76ms vs OpenCV 2.02ms，
+    两阶段本已合计更快 → lose 主因是 OpenCV createGaussianFilter 内部也是两 kernel，
+    第六轮 lose 数字计时波动大、复测不稳定）
+  - rows v2（probe_gf32b）：每线程 2 输出（tile 2*RT+k-1，MAC 双路 ILP）+ 干净内部段
+    uint4 向量化装载（越界/错位自动回退镜像逐元素），输出与单输出版逐位一致。
+    4K 1.05 vs 1.31ms（-20%）、1080p 0.29 vs 0.34ms
+  - cols v2（probe_gf32b）：每线程 2 列（512 列/块双列 ring），4K 0.768 vs 0.811ms、
+    720p 0.107 vs 0.134ms，输出逐位一致
+- RT 固定 128（原按宽度切换 128/256，v2 下 192/256 无收益）
+
+| 算子 | 参数 | 640x480 | 1280x720 | 1920x1080 | 3840x2160 |
+|---|---|---|---|---|---|
+| gaussian-f32 | k=5 | 1.18x Win | 1.23x Win | 1.10x Win | 1.12x Win |
+| gaussian-f32 | k=15 | 1.28x Win | 1.73x Win | 1.96x Win | 2.13x Win |
+
+### 第七轮结论
+- 本轮 120 项全 WIN（0 LOSE）。gaussian-f32 k=5 从 0.89~1.06x 抖动变为 1.10~1.23x 稳定 WIN；
+  k=15 提升至 1.28~2.13x。u8 各项与 f32 其余算子不受影响（行遍旧 kernel 保留未删，当前无调用方）。
+
 ## 第六轮（2026-10-09，CV_32F 输入格式支持）
 
 新增 5 个 f32 算子（integral/mean/morph/gaussian 的 CV_32FC1 进出），bench 增加 f32 组 22 项。
