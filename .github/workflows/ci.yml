@@ -1,0 +1,42 @@
+name: CI
+
+# 说明：GitHub 托管 runner 没有 NVIDIA GPU，smoke/benchmark 需要在本机跑；
+# CI 做编译级检查——所有 kernel 用 nvcc 编译到 PTX/cubin，保证语法与寄存器层面无回归。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nvcc-compile:
+    name: nvcc compile check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [sm_61, sm_75, sm_86, sm_89]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda
+        with:
+          cuda: '12.5.0'
+          method: network
+          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev"]'
+
+      - name: Compile all kernels (${{ matrix.arch }})
+        shell: bash
+        run: |
+          NVCC="${{ steps.cuda.outputs.CUDA_PATH }}/bin/nvcc"
+          mkdir -p build/obj
+          status=0
+          for f in src/*.cu; do
+            echo "=== $f"
+            "$NVCC" -O3 --use_fast_math -std=c++17 -arch=${{ matrix.arch }} \
+              -Xcompiler "-Wall -Wextra" -c "$f" -o "build/obj/$(basename "${f%.cu}").obj" || status=1
+          done
+          exit $status
+
