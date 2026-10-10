@@ -1,0 +1,6 @@
+* text=auto
+*.bat text eol=crlf
+*.cu text
+*.h text
+*.md text
+*.csv text

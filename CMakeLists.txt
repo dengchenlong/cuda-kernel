@@ -10,8 +10,12 @@ set(CMAKE_CUDA_ARCHITECTURES 61)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math -Xptxas -O3,-allow-expensive-optimizations=true")
 
 find_package(CUDAToolkit REQUIRED)
-# OpenCV-CUDA 构建位置：D:\opencv-cuda-build\install（见 PROGRESS.md）
-set(OpenCV_DIR "D:/opencv-cuda-build/install" CACHE PATH "")
+# OpenCV-CUDA 安装位置：用 -DOpenCV_DIR=<path> 指定你的构建
+# （需含 core/imgproc/cudaarithm/cudawarping/cudaimgproc/cudafilters，构建方法见 scripts/build_opencv_cuda.bat）
+set(OpenCV_DIR "" CACHE PATH "OpenCV-CUDA install prefix")
+if(NOT OpenCV_DIR)
+    message(FATAL_ERROR "请用 -DOpenCV_DIR=<OpenCV-CUDA 安装目录> 指定（例：cmake -DOpenCV_DIR=D:/opencv-cuda-build/install ..）")
+endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc cudaarithm cudawarping cudaimgproc cudafilters)
 
 add_library(gpuops STATIC
