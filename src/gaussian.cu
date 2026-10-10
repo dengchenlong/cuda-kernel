@@ -421,6 +421,59 @@ __global__ void gauss32_rows_kernel(const float* __restrict__ src, size_t sstep,
     tmp[(size_t)y * (tstep >> 2) + x] = acc;
 }
 
+// f32 行遍 v2：每线程 2 个输出（tile 宽 2*RT + k - 1，MAC 循环两路 ILP）。
+// probe_gf32b 实测比单输出版快 15~25%（1080p 0.29 vs 0.34ms、4K 1.05 vs 1.31ms），
+// 输出与单输出版逐位一致（MAC 次序相同）。W 极小（< 2*RT）时 g0<0 或 g0+N>W 走镜像回退。
+__global__ void gauss32_rows2_kernel(const float* __restrict__ src, size_t sstep,
+                                     float* __restrict__ tmp, size_t tstep,
+                                     int W, int k)
+{
+    extern __shared__ float tileg[];            // 2*RT + k - 1
+    const int RT = blockDim.x;
+    const int y = blockIdx.y;
+    const int x0 = blockIdx.x * (2 * RT);
+    const int tid = threadIdx.x;
+    const int N = 2 * RT + k - 1;
+    const int half = k / 2;
+    const float* srow = src + (size_t)y * (sstep >> 2);
+
+    // 本块需要的元素范围 [x0-half, x0+2RT-1+half]（tile 索引 i ↔ 元素 g0+i）
+    const int g0 = x0 - half;
+    const bool aligned4 = ((reinterpret_cast<uintptr_t>(srow) & 15) == 0) && ((sstep & 15) == 0);
+    if (aligned4 && (g0 >= 0) && (g0 + N <= W) && ((g0 & 3) == 0)) {
+        // 干净内部段：uint4 向量化装载（其余元素逐个补齐）
+        const float4* r4 = (const float4*)(srow + g0);
+        for (int i = tid; i < (N >> 2); i += RT) {
+            const float4 v = r4[i];
+            tileg[i*4] = v.x; tileg[i*4+1] = v.y; tileg[i*4+2] = v.z; tileg[i*4+3] = v.w;
+        }
+        for (int i = (N & ~3) + tid; i < N; i += RT) tileg[i] = srow[g0 + i];
+    } else {
+        for (int i = tid; i < N; i += RT) {
+            int x = g0 + i;
+            if (x < 0)  x = -x;
+            if (x >= W) x = 2 * W - 2 - x;
+            x = max(0, min(W - 1, x));
+            tileg[i] = srow[x];
+        }
+    }
+    __syncthreads();
+
+    const int xa = x0 + tid;
+    const int xb = xa + RT;
+    if (xa >= W) return;
+    float acca = 0.f, accb = 0.f;
+    const float* pa = tileg + tid;
+    const float* pb = tileg + tid + RT;
+    for (int j = 0; j < k; ++j) {
+        const float wj = c_w[j];
+        acca = fmaf(wj, pa[j], acca);
+        if (xb < W) accb = fmaf(wj, pb[j], accb);
+    }
+    tmp[(size_t)y * (tstep >> 2) + xa] = acca;
+    if (xb < W) tmp[(size_t)y * (tstep >> 2) + xb] = accb;
+}
+
 __global__ void gauss32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
                                     float* __restrict__ dst, size_t dstep,
                                     int W, int H, int k, int rpt)
@@ -463,6 +516,65 @@ __global__ void gauss32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
     }
 }
 
+// f32 列遍 v2：每线程 2 列（smem ring 双列交错，512 列/块）。
+// probe_gf32b：720p rpt=64 0.107 vs 0.134ms、4K rpt=64 0.768 vs 0.811ms，输出逐位一致。
+__global__ void gauss32_cols2_kernel(const float* __restrict__ tmp, size_t tstep,
+                                     float* __restrict__ dst, size_t dstep,
+                                     int W, int H, int k, int rpt)
+{
+    extern __shared__ float ringg[];            // k * 512（双列交错，线程 tid 持列 2*tid / 2*tid+1）
+    const int tid = threadIdx.x;
+    const int x = blockIdx.x * 512 + 2 * tid;
+    if (x >= W) return;
+    const bool two = (x + 1 < W);
+    const int y0 = blockIdx.y * rpt;
+    const int y1 = min(H, y0 + rpt);
+    const int half = k / 2;
+    const size_t rows = tstep >> 2, orows = dstep >> 2;
+    const float* scol0 = tmp + x;
+    const float* scol1 = tmp + x + 1;
+    float* col0 = ringg + 2 * tid;
+    float* col1 = ringg + 2 * tid + 1;
+
+    auto fetch0 = [=](int r) -> float {
+        int rr = r;
+        if (rr < 0)  rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol0[(size_t)rr * rows];
+    };
+    auto fetch1 = [=](int r) -> float {
+        int rr = r;
+        if (rr < 0)  rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol1[(size_t)rr * rows];
+    };
+
+    for (int j = 0; j < k; ++j) {
+        col0[j * 512] = fetch0(j - half + y0);
+        if (two) col1[j * 512] = fetch1(j - half + y0);
+    }
+    int oldest = 0;
+    for (int r = y0; r < y1; ++r) {
+        float a0 = 0.f, a1 = 0.f;
+        int slot = oldest;
+        for (int j = 0; j < k; ++j) {
+            const float wj = c_w[j];
+            a0 = fmaf(wj, col0[slot * 512], a0);
+            if (two) a1 = fmaf(wj, col1[slot * 512], a1);
+            if (++slot == k) slot = 0;
+        }
+        dst[(size_t)r * orows + x] = a0;
+        if (two) dst[(size_t)r * orows + x + 1] = a1;
+        if (r + 1 < y1) {
+            col0[oldest * 512] = fetch0(r + 1 + half);
+            if (two) col1[oldest * 512] = fetch1(r + 1 + half);
+            if (++oldest == k) oldest = 0;
+        }
+    }
+}
+
 } // namespace
 
 void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
@@ -477,15 +589,18 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
     float* tmp = (float*)ws_grow(fstep * height + 1024);
 
     {
-        // f32 行遍数据量是 u8 的 4 倍：大图 RT=128 提升占用率更划算（实测 1080p/4K 更优）
-        const int RT = width > 2560 ? 128 : R_THREADS;
-        const int smemRT = (RT + ksize - 1) * (int)sizeof(float);
-        dim3 g(idiv_up(width, RT), height), t(RT);
-        gauss32_rows_kernel<<<g, t, smemRT, stream>>>(d_src, srcStep, tmp, fstep, width, ksize);
+        // f32 行遍 v2：每线程 2 输出 + uint4 装载。RT=128（probe_gf32b：1080p 0.29 vs 0.34ms、
+        // 4K 1.05 vs 1.31ms；RT=192/256 无进一步收益）。tile 宽 2*RT + k - 1 = 259 floats。
+        const int RT = 128;
+        const int smemRT = (2 * RT + ksize - 1) * (int)sizeof(float);
+        dim3 g(idiv_up(width, 2 * RT), height), t(RT);
+        gauss32_rows2_kernel<<<g, t, smemRT, stream>>>(d_src, srcStep, tmp, fstep, width, ksize);
     }
     {
-        const int smem = ksize * C_THREADS * (int)sizeof(float);
-        dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
-        gauss32_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
+        // f32 列遍 v2：每线程 2 列、512 列/块。probe_gf32b：720p rpt=64 0.107 vs 0.134、
+        // 4K rpt=64 0.768 vs 0.811；rpt 沿用 u8 版公式（>1080 用 64，否则 16）。
+        const int smem = ksize * 512 * (int)sizeof(float);
+        dim3 g(idiv_up(width, 512), idiv_up(height, rpt)), t(C_THREADS);
+        gauss32_cols2_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
     }
 }
