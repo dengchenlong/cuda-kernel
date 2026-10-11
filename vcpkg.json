@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cuda-kernel",
+  "version-string": "0.1.0",
+  "description": "High-performance CUDA image kernels (Pascal sm_61), benchmarked against OpenCV-CUDA",
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [ "cuda" ]
+    }
+  ]
+}
