@@ -262,9 +262,17 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
                           ((reinterpret_cast<uintptr_t>(d_src) & 15) == 0) &&
                           ((width & 15) == 0);
     if (aligned4) {
-        // spike 003：grid 按行数自适应（Pascal 时代固定 48 block 只占 sm_120 170 SM 的 28%，
-        // 4K 差 2 倍）。下限 48 保留小图/旧卡行为，上限 256 与 partials 分配一致。
-        const int blocks = min(HIST_GRID_MAX, max(HIST_GRID, (height + 7) / 8));
+        // spike 003：grid 按行数自适应（Pascal 时代固定 48 block 只占大卡的一小部分 SM，
+        // 4K 差 2 倍）。上限取 SM 数（170blk 在 4K 主口径实测最优 0.0092ms；
+        // 256blk 反而 0.0109），下限 48 保留小图/旧卡行为。
+        static int smCount = 0;
+        if (!smCount) {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev);
+            if (smCount <= 0) smCount = HIST_GRID_MAX;
+        }
+        const int blocks = min(smCount, max(HIST_GRID, (height + 7) / 8));
         const dim3 t(32, 8);
         hist_lastblock_kernel<<<blocks, t, 0, stream>>>(d_src, srcStep, width, height,
                                                            d_hist, ws().partials, ws().counter);
