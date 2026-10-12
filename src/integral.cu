@@ -12,60 +12,64 @@ constexpr int CHUNK_H   = 512;      // 列扫描 chunk 高度
 constexpr int CT_THREADS = 128;     // 列扫描 block 线程数 (每线程 4 列 → 512 列/block)
 
 // ---------------- Pass 1: 行扫描 ----------------
+// v2 launch shape（spike 001 实测）：每 block 8 行、每 warp 独占一行，grid=(H+7)/8。
+// 旧版固定 12 block×256（96 warp）在 sm_120（170 SM）上只占一小部分 SM，
+// 4K 0.53ms；新 shape 4K 0.19ms（2.8x），全尺寸超 OpenCV（720p 4.1x/4K 2.2x）。
+// 内核逐指令与旧版 grid-stride 版一致，数值路径零改动（sm_61 同样受益或持平）。
 __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                      uint32_t* __restrict__ dst, size_t dstep,
                                      int W, int H)
 {
     const int lane  = threadIdx.x & 31;
-    const int warp  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    const int nwarps = (gridDim.x * blockDim.x) >> 5;
+    const int warp  = threadIdx.x >> 5;
+    constexpr int SEG_BYTES = 512;      // 32 lanes * 16B
     const bool vecOK = ((sstep & 15) == 0) &&
                        ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
 
-    for (int y = warp; y < H; y += nwarps) {
-        const uint8_t* srow = src + (size_t)y * sstep;
-        uint32_t* drow = (uint32_t*)((uint8_t*)dst + (size_t)y * dstep);
-        uint32_t carry = 0;
+    const int y = blockIdx.x * 8 + warp;
+    if (y >= H) return;
+    const uint8_t* srow = src + (size_t)y * sstep;
+    uint32_t* drow = (uint32_t*)((uint8_t*)dst + (size_t)y * dstep);
+    uint32_t carry = 0;
 
-        for (int x0 = 0; x0 < W; x0 += SEG_BYTES) {
-            const int my0 = x0 + lane * 16;          // 本 lane 负责 16 字节
-            uint32_t vals[16];
-            uint32_t partial = 0;
+    for (int x0 = 0; x0 < W; x0 += SEG_BYTES) {
+        const int my0 = x0 + lane * 16;          // 本 lane 负责 16 字节
+        uint32_t vals[16];
+        uint32_t partial = 0;
 
-            if (my0 + 16 <= W && vecOK) {
-                // 快路径：对齐 uint4 读
-                union { uint4 v; uint8_t b[16]; } u;
-                u.v = *reinterpret_cast<const uint4*>(srow + my0);
+        if (my0 + 16 <= W && vecOK) {
+            // 快路径：对齐 uint4 读
+            union { uint4 v; uint8_t b[16]; } u;
+            u.v = *reinterpret_cast<const uint4*>(srow + my0);
 #pragma unroll
-                for (int k = 0; k < 16; ++k) { vals[k] = u.b[k]; partial += vals[k]; }
-            } else {
-#pragma unroll
-                for (int k = 0; k < 16; ++k) {
-                    const int x = my0 + k;
-                    uint32_t v = 0;
-                    if (x < W) v = srow[x];
-                    vals[k] = v; partial += v;
-                }
-            }
-
-            // warp 内 inclusive scan
-            uint32_t inc = partial;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
-                if (lane >= d) inc += t;
-            }
-            const uint32_t excl = inc - partial + carry;
-            const uint32_t seg_total = __shfl_sync(0xffffffffu, inc, 31);
-            carry += seg_total;
-
-            uint32_t run = excl;
+            for (int k = 0; k < 16; ++k) { vals[k] = u.b[k]; partial += vals[k]; }
+        } else {
 #pragma unroll
             for (int k = 0; k < 16; ++k) {
-                run += vals[k];
                 const int x = my0 + k;
-                if (x < W) drow[x] = run;
+                uint32_t v = 0;
+                if (x < W) v = srow[x];
+                vals[k] = v; partial += v;
             }
+        }
+
+        // warp 内 inclusive scan
+        uint32_t inc = partial;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
+            if (lane >= d) inc += t;
+        }
+        const uint32_t excl = inc - partial + carry;
+        const uint32_t seg_total = __shfl_sync(0xffffffffu, inc, 31);
+        carry += seg_total;
+
+        uint32_t run = excl;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            run += vals[k];
+            const int x = my0 + k;
+            if (x < W) drow[x] = run;
         }
     }
 }
@@ -193,10 +197,10 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
 {
     if (width <= 0 || height <= 0) return;
 
-    // Pass 1：行扫描，启动 ~96 个 warp，grid-stride 行
+    // Pass 1：每 block 8 行（每 warp 一行），grid=(H+7)/8（spike 001：sm_120 上 2.8x）
     {
         const int warpsPerBlock = 8;           // 256 线程
-        const int blocks = 12;                  // 96 warps
+        const int blocks = (height + 7) / 8;
         integral_rows_kernel<<<blocks, warpsPerBlock * 32, 0, stream>>>(
             d_src, srcStep, d_dst, dstStep, width, height);
     }

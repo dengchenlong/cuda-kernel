@@ -263,6 +263,97 @@ __global__ void gauss7_cols_u16_kernel(const uint16_t* __restrict__ src, size_t 
     }
 }
 
+// ---------------- 行遍 v4：OpenCV 同构 4-patch + halo smem 布局（spike 002）----------------
+// 32x8 block，每线程 4 输出，smem tile = (4+2)*32 元素/行 × 8 行；全 smem MAC。
+// 1080p k=15 0.040→0.016ms (2.5x)、4K k=15 0.088→0.049；逐位结果与 1 输出版一致
+// （MAC 次序 j=0..k-1 相同）。
+__global__ void gauss_rows4_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   float* __restrict__ dst, size_t dstep,
+                                   int W, int H, int k)
+{
+    constexpr int BDX = 32, BDY = 8, PPB = 4, HALO = 1;
+    __shared__ float smem[BDY][(PPB + 2 * HALO) * BDX];
+    const int half = k / 2;
+    const int y = blockIdx.y * BDY + threadIdx.y;
+    if (y >= H) return;
+    const uint8_t* srow = src + (size_t)y * sstep;
+    const int xStart = blockIdx.x * (PPB * BDX) + threadIdx.x;
+    float* sm = smem[threadIdx.y];
+
+    auto load = [&](int idx, int x) {
+        if (x < 0) x = -x;
+        if (x >= W) x = 2 * W - 2 - x;
+        x = max(0, min(W - 1, x));
+        sm[idx] = (float)srow[x];
+    };
+    // 左 halo（blockIdx.x==0 时镜像边界由 load 内 clamp 处理，无需分支）
+#pragma unroll
+    for (int j = 0; j < HALO; ++j) load(threadIdx.x + j * BDX, xStart - (HALO - j) * BDX);
+    // 主体 + 右 halo
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) load(threadIdx.x + (HALO + j) * BDX, xStart + j * BDX);
+#pragma unroll
+    for (int j = 0; j < HALO; ++j) load(threadIdx.x + (PPB + HALO + j) * BDX, xStart + (PPB + j) * BDX);
+    __syncthreads();
+
+    const int anchor = half;
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) {
+        const int x = xStart + j * BDX;
+        if (x < W) {
+            float sum = 0.f;
+            const int base = threadIdx.x + (HALO + j) * BDX - anchor;
+#pragma unroll 8
+            for (int q = 0; q < k; ++q) sum = fmaf(c_w[q], sm[base + q], sum);
+            dst[(size_t)y * (dstep >> 2) + x] = sum;
+        }
+    }
+}
+
+// ---------------- 列遍 v4：OpenCV 同构 4-patch + halo 行 smem（spike 002）----------------
+// 32x8 block，每线程 4 个输出行；smem tile = (4+2*HALO)*8 行 × 32 列，halo 行复用。
+// 与 ring 滚动版逐位一致（MAC 次序 j=0..k-1 相同）。
+__global__ void gauss_cols4_kernel(const float* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int H, int k)
+{
+    constexpr int BDX = 32, BDY = 8, PPB = 4;
+    const int HALO = (k <= 16) ? 1 : 2;
+    __shared__ float smem[(PPB + 2 * 2) * BDY][BDX];    // 按 HALO=2 上界分配
+    const int half = k / 2;
+    const int x = blockIdx.x * BDX + threadIdx.x;
+    if (x >= W) return;
+    const int yStart = blockIdx.y * (BDY * PPB) + threadIdx.y;
+    const size_t rows = sstep >> 2;
+    const float* scol = src + x;
+
+    auto fetch = [&](int r) -> float {
+        int rr = r;
+        if (rr < 0) rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol[(size_t)rr * rows];
+    };
+#pragma unroll
+    for (int j = 0; j < PPB + 2 * HALO; ++j)
+        smem[j * BDY + threadIdx.y][threadIdx.x] = fetch(yStart - HALO * BDY + j * BDY);
+    __syncthreads();
+
+    const int anchor = half;
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) {
+        const int y = yStart + j * BDY;
+        if (y < H) {
+            float sum = 0.f;
+#pragma unroll 8
+            for (int q = 0; q < k; ++q)
+                sum = fmaf(c_w[q], smem[(HALO + j) * BDY + threadIdx.y - anchor + q][threadIdx.x], sum);
+            const int v = __float2int_rn(sum);
+            dst[(size_t)y * dstep + x] = (uint8_t)max(0, min(255, v));
+        }
+    }
+}
+
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
 void* ws_grow(size_t need) {
@@ -370,20 +461,19 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     make_gauss_kernel(ksize, sigma, hw);
     CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
 
-    const size_t fstep = (size_t)width * 4;
-    float* tmp = (float*)ws_grow(fstep * height + 1024);
-
+    // v4 路径（spike 002）：OpenCV 同构 4-patch halo 布局，全尺寸实测最快
     {
-        const int smem = R_THREADS + ksize - 1;
-        dim3 g(idiv_up(width, R_THREADS), height), t(R_THREADS);
-        gauss_rows_kernel<<<g, t, smem, stream>>>(d_src, srcStep, tmp, fstep, width, ksize);
-    }
-    {
-        const int smem = ksize * C_THREADS * (int)sizeof(float);
-        // 列遍按行分块：全场线程数 = W * ceil(H/rpt)，否则每列一线程时只有 W 线程（占用率过低）
-        // 4K 实测 rpt=64 最优（>32 后重复读的代价被占用率收益盖过；小图 rpt=8~16 更好，见 probe_k3）
-        dim3 g(idiv_up(width, C_THREADS), idiv_up(height, rpt)), t(C_THREADS);
-        gauss_cols_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
+        const size_t fstep = (size_t)width * 4;
+        float* tmp = (float*)ws_grow(fstep * height + 1024);
+        {
+            dim3 g(idiv_up(width, 32 * 4), idiv_up(height, 8)), t(32, 8);
+            gauss_rows4_kernel<<<g, t, 0, stream>>>(d_src, srcStep, tmp, fstep, width, height, ksize);
+        }
+        {
+            dim3 g(idiv_up(width, 32), idiv_up(height, 8 * 4)), t(32, 8);
+            gauss_cols4_kernel<<<g, t, 0, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize);
+        }
+        return;
     }
 }
 
@@ -575,6 +665,88 @@ __global__ void gauss32_cols2_kernel(const float* __restrict__ tmp, size_t tstep
     }
 }
 
+// f32 v4：OpenCV 同构 4-patch halo 布局（spike 002），输入/输出/中间全 float。
+__global__ void gauss32_rows4_kernel(const float* __restrict__ src, size_t sstep,
+                                     float* __restrict__ dst, size_t dstep,
+                                     int W, int H, int k)
+{
+    constexpr int BDX = 32, BDY = 8, PPB = 4, HALO = 1;
+    __shared__ float smem[BDY][(PPB + 2 * HALO) * BDX];
+    const int half = k / 2;
+    const int y = blockIdx.y * BDY + threadIdx.y;
+    if (y >= H) return;
+    const float* srow = src + (size_t)y * (sstep >> 2);
+    const int xStart = blockIdx.x * (PPB * BDX) + threadIdx.x;
+    float* sm = smem[threadIdx.y];
+
+    auto load = [&](int idx, int x) {
+        if (x < 0) x = -x;
+        if (x >= W) x = 2 * W - 2 - x;
+        x = max(0, min(W - 1, x));
+        sm[idx] = srow[x];
+    };
+#pragma unroll
+    for (int j = 0; j < HALO; ++j) load(threadIdx.x + j * BDX, xStart - (HALO - j) * BDX);
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) load(threadIdx.x + (HALO + j) * BDX, xStart + j * BDX);
+#pragma unroll
+    for (int j = 0; j < HALO; ++j) load(threadIdx.x + (PPB + HALO + j) * BDX, xStart + (PPB + j) * BDX);
+    __syncthreads();
+
+    const int anchor = half;
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) {
+        const int x = xStart + j * BDX;
+        if (x < W) {
+            float sum = 0.f;
+            const int base = threadIdx.x + (HALO + j) * BDX - anchor;
+#pragma unroll 8
+            for (int q = 0; q < k; ++q) sum = fmaf(c_w[q], sm[base + q], sum);
+            dst[(size_t)y * (dstep >> 2) + x] = sum;
+        }
+    }
+}
+
+__global__ void gauss32_cols4_kernel(const float* __restrict__ src, size_t sstep,
+                                     float* __restrict__ dst, size_t dstep,
+                                     int W, int H, int k)
+{
+    constexpr int BDX = 32, BDY = 8, PPB = 4;
+    const int HALO = (k <= 16) ? 1 : 2;
+    __shared__ float smem[(PPB + 2 * 2) * BDY][BDX];
+    const int half = k / 2;
+    const int x = blockIdx.x * BDX + threadIdx.x;
+    if (x >= W) return;
+    const int yStart = blockIdx.y * (BDY * PPB) + threadIdx.y;
+    const size_t rows = sstep >> 2, orows = dstep >> 2;
+    const float* scol = src + x;
+
+    auto fetch = [&](int r) -> float {
+        int rr = r;
+        if (rr < 0) rr = -rr;
+        if (rr >= H) rr = 2 * H - 2 - rr;
+        rr = max(0, min(H - 1, rr));
+        return scol[(size_t)rr * rows];
+    };
+#pragma unroll
+    for (int j = 0; j < PPB + 2 * HALO; ++j)
+        smem[j * BDY + threadIdx.y][threadIdx.x] = fetch(yStart - HALO * BDY + j * BDY);
+    __syncthreads();
+
+    const int anchor = half;
+#pragma unroll
+    for (int j = 0; j < PPB; ++j) {
+        const int y = yStart + j * BDY;
+        if (y < H) {
+            float sum = 0.f;
+#pragma unroll 8
+            for (int q = 0; q < k; ++q)
+                sum = fmaf(c_w[q], smem[(HALO + j) * BDY + threadIdx.y - anchor + q][threadIdx.x], sum);
+            dst[(size_t)y * orows + x] = sum;
+        }
+    }
+}
+
 } // namespace
 
 void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
@@ -584,23 +756,15 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
     make_gauss_kernel(ksize, sigma, hw);
     CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
 
-    const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+    // v4 路径（spike 002）
     const size_t fstep = (size_t)width * 4;
     float* tmp = (float*)ws_grow(fstep * height + 1024);
-
     {
-        // f32 行遍 v2：每线程 2 输出 + uint4 装载。RT=128（probe_gf32b：1080p 0.29 vs 0.34ms、
-        // 4K 1.05 vs 1.31ms；RT=192/256 无进一步收益）。tile 宽 2*RT + k - 1 = 259 floats。
-        const int RT = 128;
-        const int smemRT = (2 * RT + ksize - 1) * (int)sizeof(float);
-        dim3 g(idiv_up(width, 2 * RT), height), t(RT);
-        gauss32_rows2_kernel<<<g, t, smemRT, stream>>>(d_src, srcStep, tmp, fstep, width, ksize);
+        dim3 g(idiv_up(width, 32 * 4), idiv_up(height, 8)), t(32, 8);
+        gauss32_rows4_kernel<<<g, t, 0, stream>>>(d_src, srcStep, tmp, fstep, width, height, ksize);
     }
     {
-        // f32 列遍 v2：每线程 2 列、512 列/块。probe_gf32b：720p rpt=64 0.107 vs 0.134、
-        // 4K rpt=64 0.768 vs 0.811；rpt 沿用 u8 版公式（>1080 用 64，否则 16）。
-        const int smem = ksize * 512 * (int)sizeof(float);
-        dim3 g(idiv_up(width, 512), idiv_up(height, rpt)), t(C_THREADS);
-        gauss32_cols2_kernel<<<g, t, smem, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize, rpt);
+        dim3 g(idiv_up(width, 32), idiv_up(height, 8 * 4)), t(32, 8);
+        gauss32_cols4_kernel<<<g, t, 0, stream>>>(tmp, fstep, d_dst, dstStep, width, height, ksize);
     }
 }
