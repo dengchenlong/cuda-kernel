@@ -4,3 +4,17 @@ build-vcpkg/
 out/
 temp/
 .vscode/
+vcpkg_installed/
+spikes/**/probe1
+spikes/**/probe2
+spikes/**/probe3
+spikes/**/probe4
+spikes/**/probe5
+spikes/**/probe6
+spikes/**/p1run
+spikes/**/p2run
+spikes/**/p3run
+spikes/**/p4run
+spikes/**/p5run
+spikes/**/p6run
+bench_results.csv

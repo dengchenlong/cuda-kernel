@@ -262,8 +262,11 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
                           ((reinterpret_cast<uintptr_t>(d_src) & 15) == 0) &&
                           ((width & 15) == 0);
     if (aligned4) {
+        // spike 003：grid 按行数自适应（Pascal 时代固定 48 block 只占 sm_120 170 SM 的 28%，
+        // 4K 差 2 倍）。下限 48 保留小图/旧卡行为，上限 256 与 partials 分配一致。
+        const int blocks = min(HIST_GRID_MAX, max(HIST_GRID, (height + 7) / 8));
         const dim3 t(32, 8);
-        hist_lastblock_kernel<<<HIST_GRID, t, 0, stream>>>(d_src, srcStep, width, height,
+        hist_lastblock_kernel<<<blocks, t, 0, stream>>>(d_src, srcStep, width, height,
                                                            d_hist, ws().partials, ws().counter);
     } else {
         hist_vec_lastblock_kernel<<<HIST_GRID, HIST_THREADS, 0, stream>>>(
