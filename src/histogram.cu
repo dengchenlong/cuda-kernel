@@ -262,9 +262,10 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
                           ((reinterpret_cast<uintptr_t>(d_src) & 15) == 0) &&
                           ((width & 15) == 0);
     if (aligned4) {
-        // spike 003：grid 按行数自适应（Pascal 时代固定 48 block 只占大卡的一小部分 SM，
-        // 4K 差 2 倍）。上限取 SM 数（170blk 在 4K 主口径实测最优 0.0092ms；
-        // 256blk 反而 0.0109），下限 48 保留小图/旧卡行为。
+        // spike 003：grid 按行数自适应。块数 = clamp((H+7)/8, HIST_GRID, min(HIST_GRID_MAX, max(HIST_GRID, smCount)))
+        // 上限取 SM 数（170blk 在 4K 主口径实测最优 0.0092ms；256blk 反而 0.0109）；
+        // 下限 48 必须在外层 —— 若写成 min(smCount, ...)，6 SM 的小卡会被压到 6 块
+        // （笔记本 1050 Ti 实测 4K 0.128→0.165ms 回归）。小卡恒为 48，与旧行为一致。
         static int smCount = 0;
         if (!smCount) {
             int dev = 0;
@@ -272,7 +273,8 @@ void gpu_histogram(const uint8_t* d_src, size_t srcStep,
             cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev);
             if (smCount <= 0) smCount = HIST_GRID_MAX;
         }
-        const int blocks = min(smCount, max(HIST_GRID, (height + 7) / 8));
+        const int cap = max(HIST_GRID, min(HIST_GRID_MAX, smCount));
+        const int blocks = min(cap, max(HIST_GRID, (height + 7) / 8));
         const dim3 t(32, 8);
         hist_lastblock_kernel<<<blocks, t, 0, stream>>>(d_src, srcStep, width, height,
                                                            d_hist, ws().partials, ws().counter);
