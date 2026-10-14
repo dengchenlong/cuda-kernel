@@ -103,10 +103,13 @@ G:\cuda-kernel
       （probe_hfix12）。probe_hfix14 280 用例全过、smoke 全绿；任意宽度 vs OpenCV 1.4~3.2x，
       vs 旧标量 1.1~1.2x（见 BENCHMARK.md 第五轮）。commit 1167707。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
-- 状态（2026-10-10）：项目必需项全部完成。CV_32F 输入格式支持已于 2026-10-09~10 完成（第六/七轮），
-  gaussian-f32 k=5 的遗留 lose 已由两阶段 v2 修复，当前 bench 120 项全 WIN。
-  后续 cron 续作回归周期性健康巡检（smoke + benchmark）确认无回退；除非用户提出新需求（如 CV_32UC1、
-  多通道、非矩形核等），不再自行启动新开发。
+- 状态（2026-10-15）：spike-hist4k（sm_120 服务器架构优化，spike 001~003c）已合并进 main（--no-ff，
+  e9b37f1）并 push；服务器（RTX 5090 D）120 项全 WIN。合并后本机健康巡检 r14（1050 Ti）：
+  smoke 全绿，bench 112 WIN / 8 lose（单轮口径），lose 集中在 erode/dilate k=3 bin @720p/1080p/4K
+  （0.87~0.99x）与 mean k=3 @4K（0.96x），与合并前 12 轮聚合结论一致（确定性 lose 5 项，其余计时噪声）。
+  本机基准结论：120 项中 115 项稳定 WIN，5 项确定性 lose（morph k=3 小核、mean k=3 大图）需开新 spike
+  （先服务器 probe，本机复验）才可攻克；除非用户提出新需求，不再自行启动新开发。
+  后续 cron 续作回归周期性健康巡检（smoke + benchmark）确认无回退。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突
