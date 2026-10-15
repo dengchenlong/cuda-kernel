@@ -110,6 +110,11 @@ G:\cuda-kernel
   本机基准结论：120 项中 115 项稳定 WIN，5 项确定性 lose（morph k=3 小核、mean k=3 大图）需开新 spike
   （先服务器 probe，本机复验）才可攻克；除非用户提出新需求，不再自行启动新开发。
   后续 cron 续作回归周期性健康巡检（smoke + benchmark）确认无回退。
+- 巡检 r15/r16（2026-10-16，1050 Ti）：smoke 全绿（0 flagged）。r15 118 WIN / 2 lose（hist-gray 720p 0.91x、
+  1080p 0.78x）；r16 119 WIN / 1 lose（hist-gray 4K 0.85x）。hist-gray 1080p/4K 在 r14~r16 间在 0.78~1.28x 之间
+  摆动（1080p 0.78~1.49x，4K 0.85~1.28x），是 ~0.1 ms 量级内核的计时噪声，但幅度大，**不算稳定 WIN**，
+  与上文「hist 各项稳定 WIN」的旧说法不符，以此为准。待办：多轮聚合（≥5 轮）判定 hist-gray 1080p/4K 是否
+  确定性 lose；若是，开 hist 小图 spike（先服务器 probe，本机复验）。数据：docs/bench/bench_sm61_r15.csv、r16.csv。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突
