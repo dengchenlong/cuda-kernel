@@ -111,10 +111,22 @@ G:\cuda-kernel
   （先服务器 probe，本机复验）才可攻克；除非用户提出新需求，不再自行启动新开发。
   后续 cron 续作回归周期性健康巡检（smoke + benchmark）确认无回退。
 - 巡检 r15/r16（2026-10-16，1050 Ti）：smoke 全绿（0 flagged）。r15 118 WIN / 2 lose（hist-gray 720p 0.91x、
-  1080p 0.78x）；r16 119 WIN / 1 lose（hist-gray 4K 0.85x）。hist-gray 1080p/4K 在 r14~r16 间在 0.78~1.28x 之间
-  摆动（1080p 0.78~1.49x，4K 0.85~1.28x），是 ~0.1 ms 量级内核的计时噪声，但幅度大，**不算稳定 WIN**，
-  与上文「hist 各项稳定 WIN」的旧说法不符，以此为准。待办：多轮聚合（≥5 轮）判定 hist-gray 1080p/4K 是否
-  确定性 lose；若是，开 hist 小图 spike（先服务器 probe，本机复验）。数据：docs/bench/bench_sm61_r15.csv、r16.csv。
+  1080p 0.78x）；r16 119 WIN / 1 lose（hist-gray 4K 0.85x）。
+- 十轮聚合判定（2026-10-17，r15~r24 各 120 项，数据 docs/bench/bench_sm61_r15~r24.csv）：
+  1. **hist-gray 1080p/4K 判定为非确定性 lose，不开 hist 小图 spike**。1080p lose 2/10（0.78/0.85，
+     中位 1.08）、4K lose 4/10（0.85~0.95，中位 1.08）；lose 在轮次间不定点复现，且整个 hist 家族
+     （gray/binary × 四尺寸）都呈现同类临界摆动——每项 lose 2~5/10、中位全部 >1.0，其中 hist-gray 720p
+     最差（5/10，r19 0.74、r24 0.69）。~0.1 ms 量级内核计时噪声主导，OpenCV 对应项也在 0.06~0.19 ms。
+  2. **r14 结论修正：morph k=3 小核与 mean k=3 @4K 的「确定性 lose」在 r15~r24 十轮中零复现**
+     （morph k=3 各口径 min ≥1.10，mean k=3 @4K min 1.13），合并 spike-hist4k 后实际已无该项 lose，
+     「本机 5 项确定性 lose」的说法作废。十轮中偶发 lose 仅剩 mean-f32 640 k=3（2/10，0.98~0.99）
+     与 gaussian-f32 640 k=5（1/10，0.84），均为临界噪声。
+  3. 结论：服务器口径（RTX 5090 D）120 项全 WIN；本机口径（1050 Ti）无确定性 lose，hist 家族为
+     中位 WIN + 高方差临界项。benchmark 计时对 <0.2 ms 内核的分辨率有限，hist 若要「逐轮全 WIN」
+     需换更稳的计时法（如固定 clock/更多重复），属可选优化，不自行启动。
+- 巡检 r17~r24（2026-10-17，1050 Ti）：smoke 全绿（0 flagged）；8 轮 lose 1~5 项/轮，全部落在 hist 家族
+  与 f32 临界项，无新回退模式。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
-  直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突
+  直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突；
+  单轮 lose 判定不可靠——hist/f32 临界项需 ≥10 轮聚合，lose 若不定点复现即为计时噪声而非确定性 lose
