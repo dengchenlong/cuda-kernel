@@ -85,8 +85,17 @@ int main(int argc, char** argv)
 
     for (const auto& sz : sizes) {
         const int W = sz.w, H = sz.h;
-        const int reps = std::max(5, std::min(50, (int)(6e8 / ((double)W * H))));
-        const int warmup = std::max(3, reps / 5);
+        // spike clock-lock（2026-10-13 用户确认）：本卡 1050 Ti 不支持 -lgc/-lmc/-ac 锁频，
+        // 计时稳定性改由「增重复次数」承担：reps 上限 50→250，中位数样本量 ×5。
+        // 回退：环境变量 BENCH_REPS 可覆盖（调试用）。
+        static int reps_override = -1;
+        if (reps_override < 0) {
+            const char* env = getenv("BENCH_REPS");
+            reps_override = env ? atoi(env) : 0;
+        }
+        const int reps = reps_override ? reps_override
+                        : std::max(60, std::min(250, (int)(6e8 / ((double)W * H))));
+        const int warmup = std::max(10, reps / 5);
 
         cv::Mat gray = randU8(W, H, false, 7);
         cv::Mat bin = randU8(W, H, true, 8);
