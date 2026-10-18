@@ -129,6 +129,14 @@ G:\cuda-kernel
 - 巡检 r25/r26（2026-10-18，1050 Ti）：smoke 全绿（0 flagged，120 [OK]）；r25 lose 2（hist-binary/gray
   640 0.72/0.75）、r26 lose 3（hist-binary 1080p 0.83、hist-gray 1080p 0.88、hist-gray 4K 0.81），
   仍全部落在 hist 家族。
+- 巡检 r27/r28（2026-10-19，1050 Ti）：smoke 全绿（0 flagged）；bench 两轮均 120/120 全 WIN
+  （十四轮以来首次单轮零 lose），CSV 落库 docs/bench/bench_sm61_r27/r28.csv。hist 家族临界摆动
+  本轮未复现，进一步支持「计时噪声、非确定性 lose」判定。
+- [x] spike-clock-lock 完成并合并（2026-10-19，--no-ff）：本卡不支持锁频（nvidia-smi -lgc/-lmc
+  与 nvcc -lgc/-ac 均被拒），改为 bench 计时重复次数上限 50→250。三轮验证 120 项中位 speedup
+  全部 ≥1.0（旧口径 hist 家族 lose 2~5/12），单轮偶发 lose 仅 3 项各 1/3（min 0.91~0.95），
+  median CV 1.1%。结论：增 reps 有效收敛中位数；hist 家族本机中位口径全 WIN，单轮逐 WIN 仍受
+  ~0.1ms 内核噪声限制。合并后本机 r27/r28 巡检（新口径）两轮均 120/120 全 WIN。
 - 十二轮聚合确认（r15~r26，2026-10-18）：有 lose 的项共 10 个，全部为 hist 家族（8 项，各 lose 2~5/12、
   中位全部 >1.0）加 mean-f32 640 k=3（2/12，中位 1.25）与 gaussian-f32 640 k=5（1/12，中位 1.25）两个
   临界噪声项。无任何项构成确定性 lose，维持「不开 hist spike」判定。解析坑：bench CSV 的 speedup 是第 7 列
