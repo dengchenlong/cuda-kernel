@@ -135,6 +135,8 @@ G:\cuda-kernel
 - 巡检 r27/r28（2026-10-19，1050 Ti）：smoke 全绿（0 flagged）；bench 两轮均 120/120 全 WIN
   （十四轮以来首次单轮零 lose），CSV 落库 docs/bench/bench_sm61_r27/r28.csv。hist 家族临界摆动
   本轮未复现，进一步支持「计时噪声、非确定性 lose」判定。
+- 巡检 r30（2026-10-22，1050 Ti，reps≤250 新口径）：smoke 全绿（0 flagged）；bench 119 WIN / 1 lose
+  （hist-binary 1080p 0.96x，hist 家族临界摆动，非确定性 lose）。CSV 落库 docs/bench/bench_sm61_r30.csv。
 - [x] spike-clock-lock 完成并合并（2026-10-19，--no-ff）：本卡不支持锁频（nvidia-smi -lgc/-lmc
   与 nvcc -lgc/-ac 均被拒），改为 bench 计时重复次数上限 50→250。三轮验证 120 项中位 speedup
   全部 ≥1.0（旧口径 hist 家族 lose 2~5/12），单轮偶发 lose 仅 3 项各 1/3（min 0.91~0.95），
