@@ -146,6 +146,8 @@ G:\cuda-kernel
   中位全部 >1.0）加 mean-f32 640 k=3（2/12，中位 1.25）与 gaussian-f32 640 k=5（1/12，中位 1.25）两个
   临界噪声项。无任何项构成确定性 lose，维持「不开 hist spike」判定。解析坑：bench CSV 的 speedup 是第 7 列
   （索引 6），误用 opencv_ms 列会得到 40 项假 lose。
+- 巡检 r31（2026-10-23，1050 Ti，reps≤250 新口径）：smoke 全绿（0 flagged）；bench 120/120 全 WIN
+  （零 lose）。CSV 落库 docs/bench/bench_sm61_r31.csv。r30 曾因网络未 push 的 commit 已于本轮补 push。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突；
