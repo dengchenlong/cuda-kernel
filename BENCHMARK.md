@@ -237,3 +237,64 @@ mean f32 差 ~1.5e-5（OpenCV 内部累加序不同），integral f32 无 OpenCV
 | gaussian-f32 | k=15 | 1.28x Win | 1.64x Win | 1.59x Win | 1.79x Win |
 | hist-binary | mine | 2.08x Win | 2.60x Win | 4.10x Win | 5.37x Win |
 | hist-gray | mine | 1.50x Win | 1.58x Win | 1.61x Win | 1.59x Win |
+
+## 第八轮（2026-10-23，服务器口径 —— RTX 5090 D v2 / sm_120 / CUDA 12.8）
+
+**口径与前七轮不同**：前七轮为笔记本 GTX 1050 Ti (sm_61)，本轮为服务器 RTX 5090 D v2 (sm_120)，
+两套数据不可混比。代码与 main（f658513）零差异，重编译后 smoke 全绿（hist gray/binary diff=0）。
+两轮完整 benchmark（r1/r2），120 项：r2 为准 117 WIN / 3 LOSE（r1 118/2）。原始数据在服务器
+`~/cuda-kernel/bench_results.csv`。
+
+### LOSE 清单（r2，按差距排序）
+
+| 算子 | 参数 | 分辨率 | mine vs opencv | speedup | 备注 |
+|---|---|---|---|---|---|
+| integral |  | 1920x1080 | 0.129 vs 0.114 | 0.884x | 唯一确定性 LOSE（r1 0.881x，两轮均在） |
+| gaussian | k=7 | 1920x1080 | 0.023 vs 0.021 | 0.945x | 两轮均现，~0.95x 边缘摆动 |
+| gaussian | k=7 | 1280x720 | 0.016 vs 0.016 | 0.980x | r2；r1 同格 0.951x，边缘 |
+
+### 分算子 × 分辨率（r2，格式：speedup，列序 640x480 / 1280x720 / 1920x1080 / 3840x2160）
+
+\* = cv 侧该格 ~0.26/0.13ms 异常慢计时（cv 计时状态敏感），真实量级取相邻分辨率。
+mine 侧两轮零大波动（无 >25% 漂移项）。
+
+| 算子 | 参数 | 640x480 | 1280x720 | 1920x1080 | 3840x2160 |
+|---|---|---|---|---|---|
+| integral |  | 3.26x | 4.18x | **0.88x Lose** | 2.40x |
+| mean | k=3 | 3.12x | 2.33x | 2.82x | 9.80x |
+| mean | k=15 | 16.30x | 13.83x | 4.28x | 9.00x |
+| mean | k=31 | 4.62x | 5.00x | 4.04x | 4.71x |
+| erode | k=3 bin | 2.25x | 28.50x* | 1.40x | 10.31x* |
+| dilate | k=3 bin | 1.69x | 1.30x | 16.96x* | 9.90x |
+| erode | k=15 bin | 12.42x | 6.89x | 3.91x | 2.05x |
+| dilate | k=15 bin | 12.06x | 4.96x | 3.73x | 2.05x |
+| erode | k=15 gray | 2.97x | 6.59x | 3.82x | 2.11x |
+| dilate | k=15 gray | 12.52x | 6.88x | 3.75x | 2.22x |
+| erode | k=31 bin | 19.05x | 14.17x | 8.66x | 6.71x |
+| dilate | k=31 bin | 19.07x | 14.24x | 8.62x | 6.63x |
+| erode | k=31 gray | 19.29x | 14.34x | 8.59x | 6.64x |
+| dilate | k=31 gray | 18.72x | 14.15x | 8.80x | 6.69x |
+| gaussian | k=5 | 30.65x* | 1.15x | 7.70x* | 8.63x |
+| gaussian | k=7 | 1.07x | **0.98x Lose** | **0.95x Lose** | 6.84x |
+| gaussian | k=15 | 1.50x | 2.50x | 1.81x | 1.77x |
+| mean-f32 | k=3 | 1.17x | 18.02x* | 11.80x* | 6.45x |
+| mean-f32 | k=15 | 23.51x* | 3.65x | 4.76x | 12.15x |
+| mean-f32 | k=31 | 2.29x | 8.47x | 7.72x | 9.79x |
+| erode-f32 | k=3 | 1.98x | 1.69x | 18.65x* | 9.18x |
+| dilate-f32 | k=3 | 35.25x* | 1.65x | 18.43x* | 2.31x |
+| erode-f32 | k=15 | 1.82x | 9.20x | 7.62x | 7.62x |
+| dilate-f32 | k=15 | 11.34x | 8.95x | 7.46x | 7.63x |
+| erode-f32 | k=31 | 3.84x | 9.91x | 10.49x | 15.46x |
+| dilate-f32 | k=31 | 10.33x | 9.84x | 10.54x | 14.80x |
+| gaussian-f32 | k=5 | 1.71x | 1.56x | 1.81x | 7.12x |
+| gaussian-f32 | k=15 | 3.17x | 1.75x | 17.24x* | 7.39x |
+| hist-binary |  | 29.55x* | 29.55x* | 1.11x | 18.63x* |
+| hist-gray |  | 27.13x* | 1.69x | 1.07x | 1.17x |
+
+### 第八轮结论（服务器 sm_120）
+
+- 剔除 cv 异常格后 hist 全分辨率全 WIN：4K gray 1.17x / binary ~1.05x（r1 对应 1.15x/1.06x）、
+  1080p 1.07~1.11x、720p 1.69x、640 ~1.3x。
+- 确定性 LOSE 仅 1 项：integral 1080p 0.88x（两轮复现；sm_61 上 integral 全 WIN，
+  疑与 sm_120 的 load/store 通道与 shared memory bank 配置差异有关，待查）。
+- gaussian u8 k=7 中小图 ~0.95x 边缘摆动，与 sm_61 第四轮已收敛的 k=7 表现不同，属新口径下复现项。
