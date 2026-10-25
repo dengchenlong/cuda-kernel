@@ -184,6 +184,9 @@ G:\cuda-kernel
     脏输出连续两次调用）；smoke 全绿（0 flagged）。
   - 巡检 r36：120/120 全 WIN，零 lose，min 1.116（dilate k=3 bin 1080p），中位 4.30x；
     CSV 落库 docs/bench/bench_sm61_r36.csv，BENCHMARK.md 增「第九轮（hist 家族两条路径重写）」。
+  - 复验 r37（同日第二轮回测）：120/120 全 WIN，零 lose，min 1.103，中位 4.27x；hist 家族
+    binary 3.95~7.35x、gray 1.42~3.24x，两轮均无临界摆动 → 原「hist 单轮偶发 lose」问题消失。
+    CSV 落库 docs/bench/bench_sm61_r37.csv。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
   远端均不存在（`git ls-remote --heads origin` 只有 main），其内容早已包含在 spike-hist4k→main 链路中。
   本地仍存两个**已合入 main** 的分支 `spike-hist4k`、`spike-clock-lock`（--no-ff 合并，保留未删，非遗留问题）。
