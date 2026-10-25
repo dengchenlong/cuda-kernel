@@ -154,6 +154,22 @@ G:\cuda-kernel
 - 巡检 r33（2026-10-25，1050 Ti，reps≤250 新口径）：smoke 全绿（0 flagged）；bench 119 WIN / 1 lose
   （hist-gray 4K 0.96x，hist 家族临界摆动，非确定性 lose）。CSV 落库 docs/bench/bench_sm61_r33.csv
   （commit 65368ed）。
+- 巡检 r34（2026-10-26，1050 Ti，reps≤250 新口径）：smoke 全绿（0 flagged）；bench 120/120 全 WIN
+  （零 lose，min 1.038 hist-binary 4K，中位 4.26x）。CSV 被同日 r35 覆盖，本轮权威数据见 r35 行。
+- 优化（2026-10-26，r35）：hist-binary 二值专用 popc 聚合路径，4K 6.0x、全尺寸 5.1~7.3x（原 1.04~1.13x）。
+  - 病灶定位（probe_binh3，4K 只算内核）：二值数据每 warp 32 lane 全落 bin0/bin255，smem 原子 32 路
+    串行 → 0.5919ms，而同字节量的灰度数据只要 0.1413ms；纯读天花板 0.0922ms。
+  - 走错的第一版：`__vcmpeq4` 计数反而更慢（0.6656ms）—— ptxas 把 vcmp4 展开成 ~12 条
+    PRMT/LOP/IADD32I/POPC，比原子还贵。**sm_61 上别用 vcmp 系列做按字节判定**。
+  - 定案：`popc(w)>>3` 直接得 255 字节数（二值数据每 0xFF 占 8 位），0 的个数 = 4 - 该值；
+    合法性用 `m=(w>>7)&0x01010101`、要求 `m*0x7F == (w & 0x7F7F7F7F)`（4 条 ALU，无 PRMT），
+    块内发现非二值字节则整块回退通用 smem 原子路径（任意数据都正确）→ 0.0993ms，已达读带宽天花板。
+  - 归约改为 partials+bin3 + last-block 完全覆写（grid 48），顺带免掉调用内 cudaMemsetAsync
+    （实测该 1KB memset 固定 17~22us，小图上占原耗时 40%+）。
+  - 验证：probe_binh1 31 用例全过（四档尺寸 × 连续/带 pitch 步长/填充步长、非二值回退、全 0/全 255、
+    图内单个杂散字节、连续两次调用不清零）；smoke 全绿（hist binary max diff = 0）。
+  - 巡检 r35 同日：bench 120/120 全 WIN（零 lose，min 1.068 hist-gray 1080p，中位 4.34x），
+    CSV 落库 docs/bench/bench_sm61_r35.csv。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
   远端均不存在（`git ls-remote --heads origin` 只有 main），其内容早已包含在 spike-hist4k→main 链路中。
   本地仍存两个**已合入 main** 的分支 `spike-hist4k`、`spike-clock-lock`（--no-ff 合并，保留未删，非遗留问题）。
