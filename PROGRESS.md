@@ -92,8 +92,12 @@ G:\cuda-kernel
       - gauss f32：显式 fmaf 后与 OpenCV 逐位一致；RT 大图 128 占用率更高；
         720p k=5 偶发 0.97x（±3% 计时噪声），其余全 WIN（1.0~1.8x）
       - smoke 新增 f32 全算子组（all pass），bench 新增 f32 组 22 项（119 WIN / 1 噪声 lose）
-- 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
+- [ ] 下一步（2026-10-26 r36 后）：最弱项已从 hist 家族转移到 **morph k=3 bin（1.12~1.18x）与
+      mean k=3 @4K（1.13x）**，两者都是 1.1x 量级稳定 WIN。若继续拉大余量，按本轮 hist 的经验
+      先量「每次调用的固定开销（launch/取数/额外 memset）」再动内核本体 —— hist 的 4x 差距里
+      有一半是 10~42us 的固定开销，不是算法。
+- 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
       的补充核（如 hist 非 16 倍数宽度的向量化、k=7 高斯定点路径、CV_32F 输入格式），非必需
@@ -170,6 +174,16 @@ G:\cuda-kernel
     图内单个杂散字节、连续两次调用不清零）；smoke 全绿（hist binary max diff = 0）。
   - 巡检 r35 同日：bench 120/120 全 WIN（零 lose，min 1.068 hist-gray 1080p，中位 4.34x），
     CSV 落库 docs/bench/bench_sm61_r35.csv。
+- 优化（2026-10-26，r36）：hist-gray 三路统一 last-block 归约、去掉调用内 memset，全尺寸 1.5~3.8x（原 1.07~1.16x）。
+  - probe_hgray 四档实测（含各自必需序列，ms）：原 global-atomic+memset 0.0573/0.0645/0.0788/0.1582 →
+    last-block grid48+uint4 0.0174/0.0261/0.0420/0.1044（640/720/1080p/4K）。
+  - 关键认识：1KB cudaMemsetAsync 固定 10~42us（Windows/WDDM 每次 launch ~10us），小图上占原耗时 40%+，
+    比内核本体还贵；last-block 只多一次 threadfence+atomicInc，净赚。
+  - 取数分档：16B 对齐走 uint4（比 4B 快 3~8%），仅 4B 对齐走 4B 版，都不满足走任意宽度通用核。
+  - 验证：probe_hgray1 30 用例全过（9 尺寸 × 连续/pitch/填充步长 704 与 700、非对齐基址、全同值单 bin、
+    脏输出连续两次调用）；smoke 全绿（0 flagged）。
+  - 巡检 r36：120/120 全 WIN，零 lose，min 1.116（dilate k=3 bin 1080p），中位 4.30x；
+    CSV 落库 docs/bench/bench_sm61_r36.csv，BENCHMARK.md 增「第九轮（hist 家族两条路径重写）」。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
   远端均不存在（`git ls-remote --heads origin` 只有 main），其内容早已包含在 spike-hist4k→main 链路中。
   本地仍存两个**已合入 main** 的分支 `spike-hist4k`、`spike-clock-lock`（--no-ff 合并，保留未删，非遗留问题）。
