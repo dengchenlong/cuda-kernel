@@ -154,6 +154,9 @@ G:\cuda-kernel
 - 巡检 r33（2026-10-25，1050 Ti，reps≤250 新口径）：smoke 全绿（0 flagged）；bench 119 WIN / 1 lose
   （hist-gray 4K 0.96x，hist 家族临界摆动，非确定性 lose）。CSV 落库 docs/bench/bench_sm61_r33.csv
   （commit 65368ed）。
+- 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
+  远端均不存在（`git ls-remote --heads origin` 只有 main），其内容早已包含在 spike-hist4k→main 链路中。
+  本地仍存两个**已合入 main** 的分支 `spike-hist4k`、`spike-clock-lock`（--no-ff 合并，保留未删，非遗留问题）。
 - 经验：cmd /c 长命令在 git-bash 下要用 MSYS_NO_PATHCONV=1 cmd /c；.cu 文件写中文注释必须带 BOM；
   同一 .cu 内多个 extern __shared__ 不能重名异型（float ring[] 与 uint16_t ring[] 冲突，改名即可）；
   直方图性能排查先看"计时内预清零"这类隐形固定开销（~20us 比内核本体还贵），再看 smem 原子冲突；
