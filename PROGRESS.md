@@ -203,6 +203,10 @@ G:\cuda-kernel
     参照 OpenCV CPU；含 W=16/17/31/33/63/127/1279 与 H=1/2/3 极扁图），smoke 120 [OK] 全绿。
   - 巡检 r41：120/120 WIN，零 lose，min 1.131（mean k=3 4K），中位 4.50x；CSV 落库
     docs/bench/bench_sm61_r41.csv（r38/r39/r40 为同日过程口径，均在 docs/bench/）。
+- 失败实验（2026-10-27 凌晨 run 断流，改动未提交，已 stash@{0}）：mean k=3 改 256x16 tile +
+  每线程固定一列滚 16 行（tile 行跨 258B）→ smoke 全绿但性能回归 0.21~0.40x（4K 1.667ms
+  vs OpenCV 0.357ms，原实现 1.13~1.17x），不要再走这条方向；该 run 同时已落地 morph k=3
+  融合内核（0d305d0）。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
