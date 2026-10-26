@@ -10,7 +10,7 @@ u8 组最低 1.09x、最高 21.8x；f32 组 118/119 项 WIN，详见 [BENCHMARK.
 |---|---|---|---|
 | 积分图 | `gpu_integral` u8 → u32 inclusive | `gpu_integral_f32`（OpenCV-CUDA 无此 API） | 分块 scan + 跨块加偏移 |
 | 均值滤波 | `gpu_mean` 任意核 | `gpu_mean_f32` | k=3 单遍 smem 直加；其余两遍分离（行前缀 → 列归一化），O(1)/像素 |
-| 腐蚀/膨胀 | `gpu_erode` / `gpu_dilate` 任意矩形核，二值+灰度 | `gpu_erode_f32` / `gpu_dilate_f32` | k≤7 行直加+列行分块；k≥9 van Herk/Gil-Werman O(1)/像素 |
+| 腐蚀/膨胀 | `gpu_erode` / `gpu_dilate` 任意矩形核，二值+灰度 | `gpu_erode_f32` / `gpu_dilate_f32` | k=3 单遍融合（16px/线程 uint4 + vminu4/funnelshift 水平 + 滚动垂直）；k=5,7 两遍直加；k≥9 van Herk/Gil-Werman O(1)/像素 |
 | 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | 分离两遍（smem tile + smem ring）；k=5/7 固定核走定点整数路径 |
 | 灰度直方图 | `gpu_histogram` 256 bins | — | uint4 合并读 + smem 私有 hist + last-block 归约（免预清零、免全局原子） |
 | 二值直方图 | `gpu_histogram_binary` | — | popcount 直数 0/255 + last-block 归约 |
@@ -87,7 +87,7 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 |---|---|---|---|---|
 | integral | **11.8x** | **6.2x** | **4.4x** | **2.9x** |
 | mean k=3 / k=31 | **2.0x / 17.7x** | **1.9x / 17.5x** | **1.5x / 18.7x** | **1.3x / 21.5x** |
-| erode/dilate k=3~31 | **1.3~15.1x** | **1.2~13.1x** | **1.2~12.5x** | **1.2~12.2x** |
+| erode/dilate k=3~31 | **2.9~15.5x** | **3.8~13.3x** | **3.5~11.0x** | **3.7~12.1x** |
 | gaussian k=5 / k=15 | **1.6x / 1.3x** | **1.4x / 1.5x** | **1.4x / 1.6x** | **1.4x / 1.7x** |
 | hist gray / binary | **3.8x / 4.8x** | **3.2x / 7.1x** | **2.3x / 5.5x** | **1.5x / 7.1x** |
 | mean-f32 k=31 | **11.2x** | **16.5x** | **16.9x** | **19.2x** |

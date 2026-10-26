@@ -5,6 +5,8 @@
 #include "ops.h"
 #include <algorithm>
 
+typedef unsigned int uint;   // Windows 下 CUDA 头不保证提供 uint
+
 namespace {
 
 constexpr int VHG_B = 128;   // 段长（=block 线程数）
@@ -84,6 +86,106 @@ __global__ void direct_cols_kernel(const uint8_t* __restrict__ src, size_t sstep
             if (++oldest == k) oldest = 0;
         }
     }
+}
+
+// ---------------- k=3 单遍融合（2026-10-27） ----------------
+// 4K 实测：两遍（rows 直加 + cols 行分块）1.46ms 里大头不是算法，而是两遍共 4 次全图流量
+// 与行遍 32400 个小 block 的调度开销；本内核单遍完成，16 像素/线程、uint4 取数、
+// 水平 3 邻域用 vminu4/vmaxu4 + funnelshift 在寄存器里做，垂直用滚动寄存器，
+// 实测 0.196ms（4K，84 GB/s ≈ 纯拷贝天花板的 92%），vs 两遍 7.4x。
+// 语义：边界按「窗口 clamp 到图内」，与 morphologyDefaultBorderValue（erode 255/dilate 0）等价。
+struct VMinU8 { __device__ __forceinline__ static uint op4(uint a, uint b) { return __vminu4(a, b); }
+                __device__ __forceinline__ static uint8_t op1(uint8_t a, uint8_t b) { return min(a, b); } };
+struct VMaxU8 { __device__ __forceinline__ static uint op4(uint a, uint b) { return __vmaxu4(a, b); }
+                __device__ __forceinline__ static uint8_t op1(uint8_t a, uint8_t b) { return max(a, b); } };
+
+template <typename Op> struct VOpOf;
+template <> struct VOpOf<MinOp> { using V = VMinU8; };
+template <> struct VOpOf<MaxOp> { using V = VMaxU8; };
+
+template <typename V, int TH>
+__global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int H)
+{
+    const int tid  = threadIdx.x;
+    const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (gx < W);
+    // 非活跃线程仍要参与 shuffle，给一个 16B 对齐的安全取数地址
+    // （W 非 16 倍数时向下取整对齐，否则 uint4 取数会 misaligned）；
+    // 活跃的尾块线程照旧读自己的 gx（16 对齐，pitch 保证不越界），这样邻居拿到的是真数据
+    const int gxl  = act ? gx : ((W - 16) & ~15);
+
+
+    // 原地（dst==src）不在这里处理：host 端先融合写 workspace 再整图拷贝回 dst，
+    // 这样内核保持最瘦（31 regs / 高占用），比在内核里做 halo + warp 边界预存快一倍
+    uint hp[4], hc[4], hn[4];
+
+    // 一行内的水平 3 邻域 min/max（4 个 32 位字打包 16 字节）
+    auto hrow = [&](const uint8_t* rp, uint o[4]) {
+        const uint4 w = *(const uint4*)(rp + gxl);
+        uint prv = __shfl_up_sync(0xffffffffu, w.w, 1);
+        uint nxt = __shfl_down_sync(0xffffffffu, w.x, 1);
+        // 跨 warp 与图像左右边界不能靠 shuffle
+        if (lane == 0) prv = (gxl < 4) ? (w.x << 24) : *(const uint*)(rp + gxl - 4);
+        if (lane == 31 || gxl + 16 >= W)
+            nxt = (gxl + 16 >= W) ? (w.w >> 24) : *(const uint*)(rp + gxl + 16);
+        const uint ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint lo = (i == 0) ? prv : ws[i - 1];
+            const uint hi = (i == 3) ? nxt : ws[i + 1];
+            o[i] = V::op4(ws[i], V::op4(__funnelshift_r(lo, ws[i], 24),
+                                        __funnelshift_l(ws[i], hi, 24)));
+        }
+    };
+
+    hrow(src + (size_t)max(0, y0 - 1) * sstep, hp);
+    hrow(src + (size_t)y0 * sstep, hc);
+    for (int y = y0; y < y1; ++y) {
+        hrow(src + (size_t)min(H - 1, y + 1) * sstep, hn);
+        if (act) {
+            uint o[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) o[i] = V::op4(hp[i], V::op4(hc[i], hn[i]));
+            *(uint4*)(dst + (size_t)y * dstep + gx) = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { hp[i] = hc[i]; hc[i] = hn[i]; }
+    }
+}
+
+// 整图 uint4 拷贝（原地路径用：融合先写 workspace，再拷回 dst）
+__global__ void copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
+                              uint8_t* __restrict__ d, size_t dstep, int W)
+{
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    const int y = blockIdx.y;
+    const uint8_t* sp = s + (size_t)y * sstep;
+    uint8_t* dp = d + (size_t)y * dstep;
+    if (x + 16 <= W) {
+        *(uint4*)(dp + x) = *(const uint4*)(sp + x);
+    } else if (x < W) {
+        for (int i = x; i < W; ++i) dp[i] = sp[i];
+    }
+}
+
+template <typename Op>
+void morph3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                  int width, int height, int TH, cudaStream_t stream)
+{
+    using V = typename VOpOf<Op>::V;
+    int th = ((width + 15) / 16 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    const int gxx = (width + 16 * th - 1) / (16 * th);
+    const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : 64);
+    dim3 g(gxx, (height + th3 - 1) / th3);
+    if (th3 == 8)       morph3_fuse_kernel<V, 8><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    else if (th3 == 16) morph3_fuse_kernel<V, 16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    else                morph3_fuse_kernel<V, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
 }
 
 template <typename Op>
@@ -264,6 +366,33 @@ void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
            int width, int height, int kw, int kh, cudaStream_t stream)
 {
     if (width <= 0 || height <= 0) return;
+
+    // k=3 单遍融合路径（2026-10-27）：out-of-place 单内核；in-place 先存 2 行/块边界再融合。
+    // 要求 16B 对齐（基址与 pitch），否则回退两遍路径（结果一致，只是慢）。
+    const bool inplace = ((const void*)d_src == (const void*)d_dst);
+    // 原地融合要求整行在一个 block 内（水平边界只可能是图像边界），W > 4096 时回退两遍路径
+    const bool fuse3 = (kw == 3 && kh == 3 && width >= 16 && width <= 4096 && (width % 16 == 0) &&
+                        (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                        ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+    if (fuse3) {
+        const int TH = height <= 800 ? 8 : (height <= 1200 ? 16 : 64);
+        if (inplace) {
+            // 原地：先融合写到 workspace（每行按 16 对齐的紧排），再整图 uint4 拷回 dst。
+            // 内核里做 halo/warp 边界预存能省掉这次拷贝，但实测寄存器从 31 涨到 52、
+            // 4K 反而慢 2x（0.19 → 0.38ms），所以选「拷一遍」。
+            const int tstep = (width + 15) & ~15;
+            uint8_t* tmp = ws_grow((size_t)tstep * height + 1024);
+            morph3_fused<Op>(d_src, srcStep, tmp, tstep, width, height, TH, stream);
+            int th = ((width + 15) / 16 + 31) / 32 * 32;
+            if (th > 256) th = 256;
+            dim3 gc((width + 16 * th - 1) / (16 * th), height);
+            copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+        } else {
+            morph3_fused<Op>(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+        }
+        return;
+    }
+
     // 注意：临时缓冲必须用与 d_dst 相同的 step 布局（用 tight width 会造成
     // vhg_cols_kernel 以 dstStep 跨行读写时越界/读串行——之前 smoke 中 gray 小核差异即由此而来）
     // 用静态 workspace：cudaMallocPitch/cudaFree 每次调用会同步设备，是计时大坑

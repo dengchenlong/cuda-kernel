@@ -93,10 +93,12 @@ G:\cuda-kernel
         720p k=5 偶发 0.97x（±3% 计时噪声），其余全 WIN（1.0~1.8x）
       - smoke 新增 f32 全算子组（all pass），bench 新增 f32 组 22 项（119 WIN / 1 噪声 lose）
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
-- [ ] 下一步（2026-10-26 r36 后）：最弱项已从 hist 家族转移到 **morph k=3 bin（1.12~1.18x）与
-      mean k=3 @4K（1.13x）**，两者都是 1.1x 量级稳定 WIN。若继续拉大余量，按本轮 hist 的经验
-      先量「每次调用的固定开销（launch/取数/额外 memset）」再动内核本体 —— hist 的 4x 差距里
-      有一半是 10~42us 的固定开销，不是算法。
+- [ ] 下一步（2026-10-27 r41 后）：最弱项已转到 **mean k=3（4K 1.13x / 1080p 1.19x / 720p 1.30x）**
+      与 gaussian-f32 k=5（1.25~1.31x）。mean k=3 的 1.10ms@4K 和 morph 优化前同源（两遍 + 32400 个小
+      block），按同样思路做单遍融合：16 px/线程、uint4、垂直 3 行滚动 + 水平 3 邻域；差别是窗口和
+      ≤765 要用 16-bit —— 用 `__byte_perm` 把字节拆成 16-bit lane + `__vadd2` 做加，
+      除 9 用定点 `(v*7282+32768)>>16`（对 v≤2295 与 round(v/9) 逐值等价）。原地同样走
+      「融合写 workspace + 拷回」（benchmark 是原地口径）。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
@@ -187,6 +189,22 @@ G:\cuda-kernel
   - 复验 r37（同日第二轮回测）：120/120 全 WIN，零 lose，min 1.103，中位 4.27x；hist 家族
     binary 3.95~7.35x、gray 1.42~3.24x，两轮均无临界摆动 → 原「hist 单轮偶发 lose」问题消失。
     CSV 落库 docs/bench/bench_sm61_r37.csv。
+- 优化（2026-10-27，r38~r41）：morph k=3 单遍融合内核，全尺寸 1.1~1.5x → 2.86~3.78x（BENCHMARK.md 第十轮）。
+  - 病灶：k≤7 的 rows→cols 两遍路径行遍按 (W/256)×H 启动，4K 是 32400 个小 block（每块 1 行 256B），
+    加 4 次全图流量，4K 1.46ms 只有 11 GB/s 有效带宽（纯 uint4 拷贝天花板 0.178ms / 93 GB/s）。
+  - 定案：单遍融合 —— 16 像素/线程、uint4 取数写回、水平 3 邻域用 `__vminu4/__vmaxu4` + `__funnelshift`
+    在寄存器里做（跨 warp 只有 lane0/lane31 各补一次 4B 读），垂直 3 行滚动寄存器；TH 按高度 8/16/64。
+    纯内核 4K 0.208ms（80 GB/s ≈ 拷贝天花板 86%），1080p 0.067、720p 0.039、640 0.024。
+  - 原地（dst==src，benchmark 口径）：先试「内核内 halo 行 + warp 边界字预存」→ 正确但寄存器 31→52，
+    4K 反而 0.19→0.38ms；最终改「融合写 workspace（16 对齐紧排）+ 整图 uint4 拷回」，4K 0.374ms。
+  - 教训：**逐字节尾块处理会让 ptxas 从 31 涨到 148 regs**（占用腰斩、4K 0.19→0.47ms）；
+    融合路径因此只接受 W%16==0 + 16B 对齐，其它宽度回退两遍老路径（正确性不变）。
+  - 验证：probe_m3v 56 用例全过（14 组尺寸 × pitch/紧排偏移 × in-place/out-of-place × erode/dilate，
+    参照 OpenCV CPU；含 W=16/17/31/33/63/127/1279 与 H=1/2/3 极扁图），smoke 120 [OK] 全绿。
+  - 巡检 r41：120/120 WIN，零 lose，min 1.131（mean k=3 4K），中位 4.50x；CSV 落库
+    docs/bench/bench_sm61_r41.csv（r38/r39/r40 为同日过程口径，均在 docs/bench/）。
+- 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
+  我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
   远端均不存在（`git ls-remote --heads origin` 只有 main），其内容早已包含在 spike-hist4k→main 链路中。
   本地仍存两个**已合入 main** 的分支 `spike-hist4k`、`spike-clock-lock`（--no-ff 合并，保留未删，非遗留问题）。
