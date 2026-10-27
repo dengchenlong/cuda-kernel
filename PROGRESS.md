@@ -234,6 +234,9 @@ G:\cuda-kernel
     smoke 120 [OK] 全绿（新增 mean k=3/15/31 in-place 三条用例）。
   - 巡检 r42：120/120 WIN 零 lose，min 1.235（mean-f32 640 k=3），中位 4.49x，p10 1.41x；
     CSV 落库 docs/bench/bench_sm61_r42.csv。
+  - 顺带体检其它算子的原地口径（probe_ipall：gaussian k=5/7/15、mean k=15/31、erode k=15/31 ×
+    640/1080p/4K，共 21 组）：in-place 与 out-of-place **逐位一致（diff=0）**，说明只有旧 mean k=3
+    那条路径有竞态，其余原地路径（靠 static workspace 分离两遍）都是安全的。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
