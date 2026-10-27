@@ -17,5 +17,6 @@ spikes/**/p3run
 spikes/**/p4run
 spikes/**/p5run
 spikes/**/p6run
-bench_results.csvspikes/**/p7run
+bench_results.csv
+spikes/**/p7run
 spikes/**/p8run

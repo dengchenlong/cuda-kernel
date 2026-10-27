@@ -1,0 +1,37 @@
+#!/bin/sh
+# pre-commit：staged 里含 src/ 或 bench/ 改动时，重编 + 跑 smoke，不过就拒绝提交。
+# 纯文档提交（AGENTS.md / PROGRESS.md / BENCHMARK.md / docs/）直接放行，不花 70 秒。
+# 绕过：SKIP_SMOKE=1 git commit ...   强制校验：PRECOMMIT_FORCE=1 git commit ...
+# 为什么存在：CI 只有四架构 nvcc 编译检查，跑不了正确性；smoke 本机 3 秒，机械挡住回归。
+
+if [ "${SKIP_SMOKE:-0}" = "1" ]; then
+  echo "[pre-commit] SKIP_SMOKE=1，跳过构建与 smoke"
+  exit 0
+fi
+
+if [ "${PRECOMMIT_FORCE:-0}" != "1" ]; then
+  if ! git diff --cached --name-only | grep -qE '^(src/|bench/)'; then
+    echo "[pre-commit] 仅文档改动，跳过构建与 smoke"
+    exit 0
+  fi
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+echo "[pre-commit] 重新编译 ..."
+BUILD_OUT="$(MSYS_NO_PATHCONV=1 cmd /c "scripts\\build_all.bat" 2>&1)"
+if ! printf '%s' "$BUILD_OUT" | grep -q "LINK_BENCH_OK"; then
+  printf '%s\n' "$BUILD_OUT" | grep -iE "error|BUILD_FAIL" | head -10 >&2
+  echo "[pre-commit] 构建失败，拒绝提交" >&2
+  exit 1
+fi
+
+echo "[pre-commit] 跑 smoke ..."
+OUT="$(MSYS_NO_PATHCONV=1 cmd /c "scripts\\run_smoke.bat" 2>&1)"
+if ! printf '%s' "$OUT" | grep -q "SMOKE: all pass"; then
+  printf '%s\n' "$OUT" | grep -viE "^\[OK\]" | tail -15 >&2
+  echo "[pre-commit] smoke 未全过，拒绝提交（上面是失败项）" >&2
+  exit 1
+fi
+echo "[pre-commit] 构建 + smoke 通过"
+exit 0
