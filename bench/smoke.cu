@@ -90,6 +90,13 @@ int main()
             CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
             char name[32]; snprintf(name, 32, "mean k=%d", k);
             maxDiff(mine, ref, name);
+
+            // 原地口径（benchmark 就是原地）：旧 mean3_direct 的 halo 竞态只有这条能抓到
+            CUDA_CHECK(cudaMemcpy2D(dMine, mstep, dGray.data, dGray.step, W, H, cudaMemcpyHostToDevice));
+            gpu_mean(dMine, mstep, dMine, mstep, W, H, k, k);
+            CUDA_CHECK(cudaMemcpy2D(mine.data, mine.step, dMine, mstep, W, H, cudaMemcpyDeviceToHost));
+            snprintf(name, 32, "mean k=%d in-place", k);
+            maxDiff(mine, ref, name);
             cudaFree(dMine);
         }
 

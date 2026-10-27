@@ -1,0 +1,126 @@
+integral         640x480                mine    0.130 ms ( 2362.2 MP/s) | opencv    0.566 ms (  542.5 MP/s) | speedup 4.35x WIN
+mean             640x480   k=3          mine    0.031 ms (10000.0 MP/s) | opencv    0.080 ms ( 3846.2 MP/s) | speedup 2.60x WIN
+mean             640x480   k=15         mine    0.219 ms ( 1401.9 MP/s) | opencv    1.375 ms (  223.4 MP/s) | speedup 6.28x WIN
+mean             640x480   k=31         mine    0.264 ms ( 1162.8 MP/s) | opencv    4.894 ms (   62.8 MP/s) | speedup 18.52x WIN
+erode            640x480   k=3 bin      mine    0.034 ms ( 9090.9 MP/s) | opencv    0.087 ms ( 3529.4 MP/s) | speedup 2.58x WIN
+dilate           640x480   k=3 bin      mine    0.022 ms (14285.7 MP/s) | opencv    0.088 ms ( 3488.4 MP/s) | speedup 4.10x WIN
+erode            640x480   k=15 bin     mine    0.519 ms (  591.7 MP/s) | opencv    2.618 ms (  117.3 MP/s) | speedup 5.04x WIN
+dilate           640x480   k=15 bin     mine    0.518 ms (  592.9 MP/s) | opencv    2.611 ms (  117.6 MP/s) | speedup 5.04x WIN
+erode            640x480   k=31 bin     mine    0.551 ms (  557.6 MP/s) | opencv    8.484 ms (   36.2 MP/s) | speedup 15.40x WIN
+dilate           640x480   k=31 bin     mine    0.553 ms (  555.6 MP/s) | opencv    8.286 ms (   37.1 MP/s) | speedup 14.99x WIN
+erode            640x480   k=15 gray    mine    0.520 ms (  590.6 MP/s) | opencv    2.655 ms (  115.7 MP/s) | speedup 5.10x WIN
+dilate           640x480   k=15 gray    mine    0.522 ms (  588.2 MP/s) | opencv    2.617 ms (  117.4 MP/s) | speedup 5.01x WIN
+erode            640x480   k=31 gray    mine    0.550 ms (  558.7 MP/s) | opencv    8.519 ms (   36.1 MP/s) | speedup 15.49x WIN
+dilate           640x480   k=31 gray    mine    0.551 ms (  557.6 MP/s) | opencv    8.343 ms (   36.8 MP/s) | speedup 15.14x WIN
+gaussian         640x480   k=5          mine    0.074 ms ( 4175.7 MP/s) | opencv    0.099 ms ( 3092.8 MP/s) | speedup 1.35x WIN
+gaussian         640x480   k=7          mine    0.095 ms ( 3225.8 MP/s) | opencv    0.122 ms ( 2521.0 MP/s) | speedup 1.28x WIN
+gaussian         640x480   k=15         mine    0.096 ms ( 3191.5 MP/s) | opencv    0.211 ms ( 1456.3 MP/s) | speedup 2.19x WIN
+mean-f32         640x480   k=3          mine    0.100 ms ( 3061.2 MP/s) | opencv    0.124 ms ( 2479.3 MP/s) | speedup 1.23x WIN
+mean-f32         640x480   k=15         mine    0.119 ms ( 2586.2 MP/s) | opencv    0.939 ms (  327.2 MP/s) | speedup 7.91x WIN
+mean-f32         640x480   k=31         mine    0.271 ms ( 1132.1 MP/s) | opencv    3.426 ms (   89.7 MP/s) | speedup 12.63x WIN
+erode-f32        640x480   k=3          mine    0.096 ms ( 3191.5 MP/s) | opencv    0.198 ms ( 1554.4 MP/s) | speedup 2.05x WIN
+dilate-f32       640x480   k=3          mine    0.096 ms ( 3191.5 MP/s) | opencv    0.197 ms ( 1562.5 MP/s) | speedup 2.04x WIN
+erode-f32        640x480   k=15         mine    0.229 ms ( 1339.3 MP/s) | opencv    1.988 ms (  154.6 MP/s) | speedup 8.67x WIN
+dilate-f32       640x480   k=15         mine    0.232 ms ( 1321.6 MP/s) | opencv    1.983 ms (  154.9 MP/s) | speedup 8.53x WIN
+erode-f32        640x480   k=31         mine    0.498 ms (  617.3 MP/s) | opencv    6.539 ms (   47.0 MP/s) | speedup 13.14x WIN
+dilate-f32       640x480   k=31         mine    0.497 ms (  618.6 MP/s) | opencv    6.527 ms (   47.1 MP/s) | speedup 13.14x WIN
+gaussian-f32     640x480   k=5          mine    0.084 ms ( 3658.5 MP/s) | opencv    0.122 ms ( 2521.0 MP/s) | speedup 1.45x WIN
+gaussian-f32     640x480   k=15         mine    0.098 ms ( 3125.0 MP/s) | opencv    0.216 ms ( 1421.8 MP/s) | speedup 2.20x WIN
+hist-binary      640x480                mine    0.014 ms (21428.6 MP/s) | opencv    0.069 ms ( 4473.4 MP/s) | speedup 4.79x WIN
+hist-gray        640x480                mine    0.017 ms (18181.8 MP/s) | opencv    0.066 ms ( 4687.5 MP/s) | speedup 3.88x WIN
+
+integral        1280x720                mine    0.317 ms ( 2903.2 MP/s) | opencv    0.806 ms ( 1143.6 MP/s) | speedup 2.54x WIN
+mean            1280x720   k=3          mine    0.058 ms (15789.5 MP/s) | opencv    0.189 ms ( 4864.9 MP/s) | speedup 3.25x WIN
+mean            1280x720   k=15         mine    0.541 ms ( 1704.5 MP/s) | opencv    3.393 ms (  271.7 MP/s) | speedup 6.27x WIN
+mean            1280x720   k=31         mine    0.700 ms ( 1315.8 MP/s) | opencv   12.579 ms (   73.3 MP/s) | speedup 17.96x WIN
+erode           1280x720   k=3 bin      mine    0.050 ms (18367.3 MP/s) | opencv    0.189 ms ( 4864.9 MP/s) | speedup 3.78x WIN
+dilate          1280x720   k=3 bin      mine    0.050 ms (18367.3 MP/s) | opencv    0.190 ms ( 4838.7 MP/s) | speedup 3.80x WIN
+erode           1280x720   k=15 bin     mine    1.512 ms (  609.3 MP/s) | opencv    6.789 ms (  135.7 MP/s) | speedup 4.49x WIN
+dilate          1280x720   k=15 bin     mine    1.512 ms (  609.3 MP/s) | opencv    6.796 ms (  135.6 MP/s) | speedup 4.49x WIN
+erode           1280x720   k=31 bin     mine    1.595 ms (  577.7 MP/s) | opencv   21.295 ms (   43.3 MP/s) | speedup 13.35x WIN
+dilate          1280x720   k=31 bin     mine    1.595 ms (  577.7 MP/s) | opencv   21.255 ms (   43.4 MP/s) | speedup 13.32x WIN
+erode           1280x720   k=15 gray    mine    1.513 ms (  608.9 MP/s) | opencv    6.820 ms (  135.1 MP/s) | speedup 4.51x WIN
+dilate          1280x720   k=15 gray    mine    1.514 ms (  608.5 MP/s) | opencv    6.833 ms (  134.9 MP/s) | speedup 4.51x WIN
+erode           1280x720   k=31 gray    mine    1.615 ms (  570.7 MP/s) | opencv   21.417 ms (   43.0 MP/s) | speedup 13.26x WIN
+dilate          1280x720   k=31 gray    mine    1.611 ms (  572.2 MP/s) | opencv   21.448 ms (   43.0 MP/s) | speedup 13.32x WIN
+gaussian        1280x720   k=5          mine    0.176 ms ( 5232.6 MP/s) | opencv    0.249 ms ( 3703.7 MP/s) | speedup 1.41x WIN
+gaussian        1280x720   k=7          mine    0.207 ms ( 4455.4 MP/s) | opencv    0.318 ms ( 2897.7 MP/s) | speedup 1.54x WIN
+gaussian        1280x720   k=15         mine    0.231 ms ( 3982.3 MP/s) | opencv    0.581 ms ( 1587.3 MP/s) | speedup 2.51x WIN
+mean-f32        1280x720   k=3          mine    0.238 ms ( 3879.3 MP/s) | opencv    0.322 ms ( 2866.2 MP/s) | speedup 1.35x WIN
+mean-f32        1280x720   k=15         mine    0.298 ms ( 3092.8 MP/s) | opencv    2.787 ms (  330.6 MP/s) | speedup 9.35x WIN
+mean-f32        1280x720   k=31         mine    0.601 ms ( 1533.2 MP/s) | opencv   10.545 ms (   87.4 MP/s) | speedup 17.54x WIN
+erode-f32       1280x720   k=3          mine    0.212 ms ( 4347.8 MP/s) | opencv    0.541 ms ( 1704.5 MP/s) | speedup 2.55x WIN
+dilate-f32      1280x720   k=3          mine    0.217 ms ( 4245.3 MP/s) | opencv    0.547 ms ( 1685.4 MP/s) | speedup 2.52x WIN
+erode-f32       1280x720   k=15         mine    0.545 ms ( 1691.7 MP/s) | opencv    5.986 ms (  154.0 MP/s) | speedup 10.99x WIN
+dilate-f32      1280x720   k=15         mine    0.547 ms ( 1685.4 MP/s) | opencv    5.975 ms (  154.2 MP/s) | speedup 10.93x WIN
+erode-f32       1280x720   k=31         mine    1.446 ms (  637.4 MP/s) | opencv   19.637 ms (   46.9 MP/s) | speedup 13.58x WIN
+dilate-f32      1280x720   k=31         mine    1.448 ms (  636.5 MP/s) | opencv   19.571 ms (   47.1 MP/s) | speedup 13.52x WIN
+gaussian-f32    1280x720   k=5          mine    0.189 ms ( 4864.9 MP/s) | opencv    0.247 ms ( 3734.4 MP/s) | speedup 1.30x WIN
+gaussian-f32    1280x720   k=15         mine    0.229 ms ( 4017.9 MP/s) | opencv    0.595 ms ( 1548.5 MP/s) | speedup 2.59x WIN
+hist-binary     1280x720                mine    0.017 ms (52941.2 MP/s) | opencv    0.127 ms ( 7258.1 MP/s) | speedup 7.29x WIN
+hist-gray       1280x720                mine    0.023 ms (39614.9 MP/s) | opencv    0.074 ms (12500.0 MP/s) | speedup 3.17x WIN
+
+integral        1920x1080               mine    0.683 ms ( 3036.0 MP/s) | opencv    1.692 ms ( 1225.8 MP/s) | speedup 2.48x WIN
+mean            1920x1080  k=3          mine    0.129 ms (16071.4 MP/s) | opencv    0.338 ms ( 6136.4 MP/s) | speedup 2.62x WIN
+mean            1920x1080  k=15         mine    1.269 ms ( 1634.4 MP/s) | opencv    7.179 ms (  288.8 MP/s) | speedup 5.66x WIN
+mean            1920x1080  k=31         mine    1.361 ms ( 1523.7 MP/s) | opencv   27.113 ms (   76.5 MP/s) | speedup 19.92x WIN
+erode           1920x1080  k=3 bin      mine    0.102 ms (20250.0 MP/s) | opencv    0.380 ms ( 5458.2 MP/s) | speedup 3.71x WIN
+dilate          1920x1080  k=3 bin      mine    0.102 ms (20250.0 MP/s) | opencv    0.385 ms ( 5385.6 MP/s) | speedup 3.76x WIN
+erode           1920x1080  k=15 bin     mine    3.393 ms (  611.2 MP/s) | opencv   14.418 ms (  143.8 MP/s) | speedup 4.25x WIN
+dilate          1920x1080  k=15 bin     mine    3.395 ms (  610.9 MP/s) | opencv   14.411 ms (  143.9 MP/s) | speedup 4.25x WIN
+erode           1920x1080  k=31 bin     mine    3.586 ms (  578.2 MP/s) | opencv   39.350 ms (   52.7 MP/s) | speedup 10.97x WIN
+dilate          1920x1080  k=31 bin     mine    3.586 ms (  578.2 MP/s) | opencv   39.314 ms (   52.7 MP/s) | speedup 10.96x WIN
+erode           1920x1080  k=15 gray    mine    3.391 ms (  611.4 MP/s) | opencv   14.442 ms (  143.6 MP/s) | speedup 4.26x WIN
+dilate          1920x1080  k=15 gray    mine    3.390 ms (  611.6 MP/s) | opencv   14.413 ms (  143.9 MP/s) | speedup 4.25x WIN
+erode           1920x1080  k=31 gray    mine    3.607 ms (  575.0 MP/s) | opencv   39.525 ms (   52.5 MP/s) | speedup 10.96x WIN
+dilate          1920x1080  k=31 gray    mine    3.609 ms (  574.6 MP/s) | opencv   39.585 ms (   52.4 MP/s) | speedup 10.97x WIN
+gaussian        1920x1080  k=5          mine    0.380 ms ( 5458.2 MP/s) | opencv    0.492 ms ( 4218.8 MP/s) | speedup 1.29x WIN
+gaussian        1920x1080  k=7          mine    0.433 ms ( 4787.2 MP/s) | opencv    0.650 ms ( 3189.0 MP/s) | speedup 1.50x WIN
+gaussian        1920x1080  k=15         mine    0.477 ms ( 4345.5 MP/s) | opencv    1.288 ms ( 1609.7 MP/s) | speedup 2.70x WIN
+mean-f32        1920x1080  k=3          mine    0.523 ms ( 3962.8 MP/s) | opencv    0.686 ms ( 3022.4 MP/s) | speedup 1.31x WIN
+mean-f32        1920x1080  k=15         mine    0.641 ms ( 3234.7 MP/s) | opencv    6.249 ms (  331.8 MP/s) | speedup 9.75x WIN
+mean-f32        1920x1080  k=31         mine    1.248 ms ( 1661.2 MP/s) | opencv   23.128 ms (   89.7 MP/s) | speedup 18.53x WIN
+erode-f32       1920x1080  k=3          mine    0.472 ms ( 4392.6 MP/s) | opencv    1.172 ms ( 1768.6 MP/s) | speedup 2.48x WIN
+dilate-f32      1920x1080  k=3          mine    0.473 ms ( 4383.1 MP/s) | opencv    1.165 ms ( 1779.4 MP/s) | speedup 2.46x WIN
+erode-f32       1920x1080  k=15         mine    1.252 ms ( 1655.8 MP/s) | opencv   13.359 ms (  155.2 MP/s) | speedup 10.67x WIN
+dilate-f32      1920x1080  k=15         mine    1.254 ms ( 1653.1 MP/s) | opencv   13.363 ms (  155.2 MP/s) | speedup 10.65x WIN
+erode-f32       1920x1080  k=31         mine    3.330 ms (  622.7 MP/s) | opencv   41.438 ms (   50.0 MP/s) | speedup 12.44x WIN
+dilate-f32      1920x1080  k=31         mine    3.329 ms (  622.9 MP/s) | opencv   41.790 ms (   49.6 MP/s) | speedup 12.55x WIN
+gaussian-f32    1920x1080  k=5          mine    0.390 ms ( 5315.0 MP/s) | opencv    0.529 ms ( 3916.8 MP/s) | speedup 1.36x WIN
+gaussian-f32    1920x1080  k=15         mine    0.473 ms ( 4383.1 MP/s) | opencv    1.292 ms ( 1604.6 MP/s) | speedup 2.73x WIN
+hist-binary     1920x1080               mine    0.034 ms (61363.6 MP/s) | opencv    0.200 ms (10378.0 MP/s) | speedup 5.91x WIN
+hist-gray       1920x1080               mine    0.037 ms (56250.0 MP/s) | opencv    0.088 ms (23546.5 MP/s) | speedup 2.39x WIN
+
+integral        3840x2160               mine    2.517 ms ( 3295.4 MP/s) | opencv    4.170 ms ( 1989.2 MP/s) | speedup 1.66x WIN
+mean            3840x2160  k=3          mine    0.446 ms (18578.0 MP/s) | opencv    1.242 ms ( 6677.7 MP/s) | speedup 2.78x WIN
+mean            3840x2160  k=15         mine    4.596 ms ( 1804.8 MP/s) | opencv   27.120 ms (  305.8 MP/s) | speedup 5.90x WIN
+mean            3840x2160  k=31         mine    4.696 ms ( 1766.2 MP/s) | opencv  102.213 ms (   81.1 MP/s) | speedup 21.77x WIN
+erode           3840x2160  k=3 bin      mine    0.376 ms (22070.8 MP/s) | opencv    1.401 ms ( 5921.1 MP/s) | speedup 3.73x WIN
+dilate          3840x2160  k=3 bin      mine    0.371 ms (22375.7 MP/s) | opencv    1.397 ms ( 5938.4 MP/s) | speedup 3.77x WIN
+erode           3840x2160  k=15 bin     mine   13.352 ms (  621.2 MP/s) | opencv   54.867 ms (  151.2 MP/s) | speedup 4.11x WIN
+dilate          3840x2160  k=15 bin     mine   13.360 ms (  620.8 MP/s) | opencv   54.612 ms (  151.9 MP/s) | speedup 4.09x WIN
+erode           3840x2160  k=31 bin     mine   14.040 ms (  590.8 MP/s) | opencv  149.494 ms (   55.5 MP/s) | speedup 10.65x WIN
+dilate          3840x2160  k=31 bin     mine   14.044 ms (  590.6 MP/s) | opencv  170.676 ms (   48.6 MP/s) | speedup 12.15x WIN
+erode           3840x2160  k=15 gray    mine   13.354 ms (  621.1 MP/s) | opencv   54.843 ms (  151.2 MP/s) | speedup 4.11x WIN
+dilate          3840x2160  k=15 gray    mine   13.358 ms (  620.9 MP/s) | opencv   54.617 ms (  151.9 MP/s) | speedup 4.09x WIN
+erode           3840x2160  k=31 gray    mine   14.140 ms (  586.6 MP/s) | opencv  149.560 ms (   55.5 MP/s) | speedup 10.58x WIN
+dilate          3840x2160  k=31 gray    mine   14.140 ms (  586.6 MP/s) | opencv  170.974 ms (   48.5 MP/s) | speedup 12.09x WIN
+gaussian        3840x2160  k=5          mine    1.393 ms ( 5955.9 MP/s) | opencv    1.865 ms ( 4448.1 MP/s) | speedup 1.34x WIN
+gaussian        3840x2160  k=7          mine    1.559 ms ( 5321.9 MP/s) | opencv    2.493 ms ( 3326.5 MP/s) | speedup 1.60x WIN
+gaussian        3840x2160  k=15         mine    1.812 ms ( 4576.3 MP/s) | opencv    5.017 ms ( 1653.4 MP/s) | speedup 2.77x WIN
+mean-f32        3840x2160  k=3          mine    1.950 ms ( 4254.2 MP/s) | opencv    2.614 ms ( 3172.7 MP/s) | speedup 1.34x WIN
+mean-f32        3840x2160  k=15         mine    2.397 ms ( 3460.1 MP/s) | opencv   24.782 ms (  334.7 MP/s) | speedup 10.34x WIN
+mean-f32        3840x2160  k=31         mine    4.802 ms ( 1727.4 MP/s) | opencv   94.714 ms (   87.6 MP/s) | speedup 19.73x WIN
+erode-f32       3840x2160  k=3          mine    1.782 ms ( 4655.2 MP/s) | opencv    4.596 ms ( 1804.8 MP/s) | speedup 2.58x WIN
+dilate-f32      3840x2160  k=3          mine    1.783 ms ( 4652.5 MP/s) | opencv    4.599 ms ( 1803.6 MP/s) | speedup 2.58x WIN
+erode-f32       3840x2160  k=15         mine    4.557 ms ( 1820.2 MP/s) | opencv   53.687 ms (  154.5 MP/s) | speedup 11.78x WIN
+dilate-f32      3840x2160  k=15         mine    4.553 ms ( 1821.9 MP/s) | opencv   53.489 ms (  155.1 MP/s) | speedup 11.75x WIN
+erode-f32       3840x2160  k=31         mine   14.241 ms (  582.4 MP/s) | opencv  166.598 ms (   49.8 MP/s) | speedup 11.70x WIN
+dilate-f32      3840x2160  k=31         mine   14.237 ms (  582.6 MP/s) | opencv  172.621 ms (   48.0 MP/s) | speedup 12.13x WIN
+gaussian-f32    3840x2160  k=5          mine    1.558 ms ( 5325.4 MP/s) | opencv    1.956 ms ( 4240.8 MP/s) | speedup 1.26x WIN
+gaussian-f32    3840x2160  k=15         mine    1.814 ms ( 4573.7 MP/s) | opencv    5.033 ms ( 1648.0 MP/s) | speedup 2.78x WIN
+hist-binary     3840x2160               mine    0.095 ms (87390.4 MP/s) | opencv    0.677 ms (12254.2 MP/s) | speedup 7.13x WIN
+hist-gray       3840x2160               mine    0.109 ms (76415.1 MP/s) | opencv    0.165 ms (50310.6 MP/s) | speedup 1.52x WIN
+
+done. results -> bench_results.csv
+BENCH_EXIT=0

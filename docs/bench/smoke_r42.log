@@ -1,0 +1,151 @@
+== case 65x49 ==
+  [OK]   integral: identical
+  [WARN] mean k=3: max diff = 1
+  [WARN] mean k=3 in-place: max diff = 1
+  [WARN] mean k=15: max diff = 1
+  [WARN] mean k=15 in-place: max diff = 1
+  [WARN] mean k=31: max diff = 1
+  [WARN] mean k=31 in-place: max diff = 1
+  [OK]   erode k=3 (bin): identical
+  [OK]   erode k=3 (gray): identical
+  [OK]   dilate k=3 (bin): identical
+  [OK]   dilate k=3 (gray): identical
+  [OK]   erode k=15 (bin): identical
+  [OK]   erode k=15 (gray): identical
+  [OK]   dilate k=15 (bin): identical
+  [OK]   dilate k=15 (gray): identical
+  [OK]   erode k=31 (bin): identical
+  [OK]   erode k=31 (gray): identical
+  [OK]   dilate k=31 (bin): identical
+  [OK]   dilate k=31 (gray): identical
+  [OK]   gauss k=5: identical
+  [OK]   gauss k=7: identical
+  [OK]   gauss k=15: identical
+  [OK] hist gray: max diff = 0
+  [OK] hist binary: max diff = 0
+  [OK] integral f32: max diff = 0
+  [OK] mean f32 k=3: max diff = 1.526e-05
+  [OK] mean f32 k=15: max diff = 1.526e-05
+  [OK] mean f32 k=31: max diff = 1.526e-05
+  [OK] erode f32 k=3: max diff = 0
+  [OK] dilate f32 k=3: max diff = 0
+  [OK] erode f32 k=15: max diff = 0
+  [OK] dilate f32 k=15: max diff = 0
+  [OK] erode f32 k=31: max diff = 0
+  [OK] dilate f32 k=31: max diff = 0
+  [OK] gauss f32 k=5: max diff = 0
+  [OK] gauss f32 k=15: max diff = 0
+== case 128x128 ==
+  [OK]   integral: identical
+  [WARN] mean k=3: max diff = 1
+  [WARN] mean k=3 in-place: max diff = 1
+  [WARN] mean k=15: max diff = 1
+  [WARN] mean k=15 in-place: max diff = 1
+  [WARN] mean k=31: max diff = 1
+  [WARN] mean k=31 in-place: max diff = 1
+  [OK]   erode k=3 (bin): identical
+  [OK]   erode k=3 (gray): identical
+  [OK]   dilate k=3 (bin): identical
+  [OK]   dilate k=3 (gray): identical
+  [OK]   erode k=15 (bin): identical
+  [OK]   erode k=15 (gray): identical
+  [OK]   dilate k=15 (bin): identical
+  [OK]   dilate k=15 (gray): identical
+  [OK]   erode k=31 (bin): identical
+  [OK]   erode k=31 (gray): identical
+  [OK]   dilate k=31 (bin): identical
+  [OK]   dilate k=31 (gray): identical
+  [OK]   gauss k=5: identical
+  [OK]   gauss k=7: identical
+  [OK]   gauss k=15: identical
+  [OK] hist gray: max diff = 0
+  [OK] hist binary: max diff = 0
+  [OK] integral f32: max diff = 0
+  [OK] mean f32 k=3: max diff = 1.526e-05
+  [OK] mean f32 k=15: max diff = 1.526e-05
+  [OK] mean f32 k=31: max diff = 1.526e-05
+  [OK] erode f32 k=3: max diff = 0
+  [OK] dilate f32 k=3: max diff = 0
+  [OK] erode f32 k=15: max diff = 0
+  [OK] dilate f32 k=15: max diff = 0
+  [OK] erode f32 k=31: max diff = 0
+  [OK] dilate f32 k=31: max diff = 0
+  [OK] gauss f32 k=5: max diff = 0
+  [OK] gauss f32 k=15: max diff = 0
+== case 640x480 ==
+  [OK]   integral: identical
+  [WARN] mean k=3: max diff = 1
+  [WARN] mean k=3 in-place: max diff = 1
+  [WARN] mean k=15: max diff = 1
+  [WARN] mean k=15 in-place: max diff = 1
+  [WARN] mean k=31: max diff = 1
+  [WARN] mean k=31 in-place: max diff = 1
+  [OK]   erode k=3 (bin): identical
+  [OK]   erode k=3 (gray): identical
+  [OK]   dilate k=3 (bin): identical
+  [OK]   dilate k=3 (gray): identical
+  [OK]   erode k=15 (bin): identical
+  [OK]   erode k=15 (gray): identical
+  [OK]   dilate k=15 (bin): identical
+  [OK]   dilate k=15 (gray): identical
+  [OK]   erode k=31 (bin): identical
+  [OK]   erode k=31 (gray): identical
+  [OK]   dilate k=31 (bin): identical
+  [OK]   dilate k=31 (gray): identical
+  [OK]   gauss k=5: identical
+  [OK]   gauss k=7: identical
+  [OK]   gauss k=15: identical
+  [OK] hist gray: max diff = 0
+  [OK] hist binary: max diff = 0
+  [OK] integral f32: max diff = 0
+  [OK] mean f32 k=3: max diff = 1.526e-05
+  [OK] mean f32 k=15: max diff = 1.526e-05
+  [OK] mean f32 k=31: max diff = 1.526e-05
+  [OK] erode f32 k=3: max diff = 0
+  [OK] dilate f32 k=3: max diff = 0
+  [OK] erode f32 k=15: max diff = 0
+  [OK] dilate f32 k=15: max diff = 0
+  [OK] erode f32 k=31: max diff = 0
+  [OK] dilate f32 k=31: max diff = 0
+  [OK] gauss f32 k=5: max diff = 0
+  [OK] gauss f32 k=15: max diff = 0
+== case 321x200 ==
+  [OK]   integral: identical
+  [WARN] mean k=3: max diff = 1
+  [WARN] mean k=3 in-place: max diff = 1
+  [WARN] mean k=15: max diff = 1
+  [WARN] mean k=15 in-place: max diff = 1
+  [WARN] mean k=31: max diff = 1
+  [WARN] mean k=31 in-place: max diff = 1
+  [OK]   erode k=3 (bin): identical
+  [OK]   erode k=3 (gray): identical
+  [OK]   dilate k=3 (bin): identical
+  [OK]   dilate k=3 (gray): identical
+  [OK]   erode k=15 (bin): identical
+  [OK]   erode k=15 (gray): identical
+  [OK]   dilate k=15 (bin): identical
+  [OK]   dilate k=15 (gray): identical
+  [OK]   erode k=31 (bin): identical
+  [OK]   erode k=31 (gray): identical
+  [OK]   dilate k=31 (bin): identical
+  [OK]   dilate k=31 (gray): identical
+  [OK]   gauss k=5: identical
+  [OK]   gauss k=7: identical
+  [OK]   gauss k=15: identical
+  [OK] hist gray: max diff = 0
+  [OK] hist binary: max diff = 0
+  [OK] integral f32: max diff = 0
+  [OK] mean f32 k=3: max diff = 1.526e-05
+  [OK] mean f32 k=15: max diff = 1.526e-05
+  [OK] mean f32 k=31: max diff = 1.526e-05
+  [OK] erode f32 k=3: max diff = 0
+  [OK] dilate f32 k=3: max diff = 0
+  [OK] erode f32 k=15: max diff = 0
+  [OK] dilate f32 k=15: max diff = 0
+  [OK] erode f32 k=31: max diff = 0
+  [OK] dilate f32 k=31: max diff = 0
+  [OK] gauss f32 k=5: max diff = 0
+  [OK] gauss f32 k=15: max diff = 0
+
+SMOKE: all pass (0 flagged)
+SMOKE_EXIT=0

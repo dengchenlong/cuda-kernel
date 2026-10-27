@@ -4,6 +4,8 @@
 #include "ops.h"
 #include <algorithm>
 
+typedef unsigned int uint;   // Windows 下 CUDA 头不保证提供 uint
+
 namespace {
 
 constexpr int MF_THREADS = 256;
@@ -118,37 +120,118 @@ __global__ void mean_cols_blocked_kernel(const uint16_t* __restrict__ tmp, size_
     }
 }
 
-// k=3 专用：单遍 3x3 直加（smem tile，每 block 32x8 输出）
-// 两遍分离法对 k=3 的 u16 tmp 往返带宽（4B/px）占比过高；单遍直加有效流量 ~2B/px。
-// 整数窗口和与分离法完全一致，输出逐位相同。
-__global__ void mean3_direct_kernel(const uint8_t* __restrict__ src, size_t sstep,
-                                    uint8_t* __restrict__ dst, size_t dstep,
-                                    int W, int H, float inv_area)
+// ---------------- k=3 单遍融合（2026-10-27） ----------------
+// 旧 mean3_direct_kernel 是 32x8 smem tile：每像素 9 次 smem 字节读、32400 个小 block，
+// 4K 1.10ms 只有 7.5 GB/s；更要命的是它的 tile halo 从 global 读，原地调用（benchmark 口径）
+// 存在跨 block 竞态 —— probe_m3a 实测 4K 69 万像素错、maxdiff 48（smoke 只测 out-of-place 所以没抓到）。
+// 本内核：16 像素/线程、uint4 取数、水平 3 邻域用 16-bit lane 在寄存器里做
+// （__byte_perm 把 4 字节展开成 2 个 u16 lane 字，__funnelshift 取左右邻，__vadd2 加），
+// 垂直 3 行滚动；原地路径先融合写 workspace（16 对齐紧排）再整图 uint4 拷回，与 morph k=3 同构。
+// 语义：窗口 clamp 到图内 = BORDER_REFLECT_101 对 3x3 中心锚点等价（halo 行/列镜像后与本像素相同）。
+// 输出 = (sum*7282+32768)>>16，sum ≤ 9*255 = 2295 时与 round(sum/9) 逐值等价（probe 全量验证）。
+
+// 4 字节 → 2 个 u16 lane（lane0=b0|lane1=b1<<16 形式）；两次 PRMT
+__device__ __forceinline__ void m3_expand(uint w, uint& lo, uint& hi)
 {
-    constexpr int TW = 32, TH = 8;
-    constexpr int TN = (TH + 2) * (TW + 2);   // 340 字节 tile
-    __shared__ uint8_t tile[TH + 2][TW + 2];
-    const int x0 = blockIdx.x * TW;
-    const int y0 = blockIdx.y * TH;
-    const int tid = threadIdx.x;              // 256 线程
+    lo = __byte_perm(w, 0, 0x4140);   // bytes [b0, 0, b1, 0]
+    hi = __byte_perm(w, 0, 0x4342);   // bytes [b2, 0, b3, 0]
+}
 
-    for (int i = tid; i < TN; i += 256) {
-        const int ty = i / (TW + 2), tx = i - ty * (TW + 2);
-        tile[ty][tx] = src[(size_t)mirror101<false>(y0 - 1 + ty, H) * sstep +
-                           mirror101<true>(x0 - 1 + tx, W)];
-    }
-    __syncthreads();
+// 两个 u16 lane（≤2295）→ 两个字节打包在低 16 位
+__device__ __forceinline__ uint m3_div9_pack(uint v)
+{
+    const uint a = v & 0xffffu, b = v >> 16;
+    const uint qa = (a * 7282u + 32768u) >> 16;
+    const uint qb = (b * 7282u + 32768u) >> 16;
+    return qa | (qb << 8);
+}
 
-    const int ty = tid >> 5, tx = tid & 31;
-    const int x = x0 + tx, y = y0 + ty;
-    if (x < W && y < H) {
-        const int sy = ty + 1, sx = tx + 1;
-        uint32_t sum = tile[sy - 1][sx - 1] + tile[sy - 1][sx] + tile[sy - 1][sx + 1] +
-                       tile[sy][sx - 1]     + tile[sy][sx]     + tile[sy][sx + 1] +
-                       tile[sy + 1][sx - 1] + tile[sy + 1][sx] + tile[sy + 1][sx + 1];
-        const int v = __float2int_rn((float)sum * inv_area);
-        dst[(size_t)y * dstep + x] = (uint8_t)max(0, min(255, v));
+template <int TH>
+__global__ void mean3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                  uint8_t* __restrict__ dst, size_t dstep, int W, int H)
+{
+    const int tid  = threadIdx.x;
+    const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (gx < W);
+    const int gxl  = act ? gx : ((W - 16) & ~15);   // 非活跃线程也给 16B 对齐安全地址参与 shuffle
+
+    uint hp[8], hc[8], hn[8];
+
+    // 一行 16 字节的水平 3 邻域和（u16 lane，≤765）
+    auto hrow = [&](const uint8_t* rp, uint o[8]) {
+        const uint4 w = *(const uint4*)(rp + gxl);
+        uint e[8];
+        m3_expand(w.x, e[0], e[1]);
+        m3_expand(w.y, e[2], e[3]);
+        m3_expand(w.z, e[4], e[5]);
+        m3_expand(w.w, e[6], e[7]);
+        uint prv = __shfl_up_sync(0xffffffffu, e[7] >> 16, 1);      // 左邻线程最后一像素
+        uint nxt = __shfl_down_sync(0xffffffffu, e[0] & 0xffffu, 1); // 右邻线程第一像素
+        // 边界必须按 BORDER_REFLECT_101 镜像（求和不能用 clamp：3 邻域 clamp≠镜像，
+        // min/max 能糊弄过去是因为 min(a,a,b)==min(a,b)，加法不行）
+        if (lane == 0) prv = (gxl == 0) ? (e[0] >> 16) : (uint)rp[gxl - 1];
+        if (lane == 31 || gxl + 16 >= W)
+            nxt = (gxl + 16 >= W) ? (e[7] & 0xffffu) : (uint)rp[gxl + 16];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint P = (k == 0) ? ((e[0] << 16) | prv) : __funnelshift_r(e[k - 1], e[k], 16);
+            const uint N = (k == 7) ? ((nxt << 16) | (e[7] >> 16)) : __funnelshift_r(e[k], e[k + 1], 16);
+            o[k] = __vadd2(__vadd2(P, e[k]), N);
+        }
+    };
+
+    // 垂直方向同样要 reflect101：y0==0 时上一行是 row 1（不是 row 0）；末行下一行是 H-2
+    hrow(src + (size_t)((y0 == 0) ? min(1, H - 1) : (y0 - 1)) * sstep, hp);
+    hrow(src + (size_t)y0 * sstep, hc);
+    for (int y = y0; y < y1; ++y) {
+        const int yn = (y + 1 < H) ? (y + 1) : max(0, H - 2);
+        hrow(src + (size_t)yn * sstep, hn);
+        if (act) {
+            uint4 o;
+            uint p[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) p[k] = m3_div9_pack(__vadd2(__vadd2(hp[k], hc[k]), hn[k]));
+            o.x = p[0] | (p[1] << 16);
+            o.y = p[2] | (p[3] << 16);
+            o.z = p[4] | (p[5] << 16);
+            o.w = p[6] | (p[7] << 16);
+            *(uint4*)(dst + (size_t)y * dstep + gx) = o;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { hp[i] = hc[i]; hc[i] = hn[i]; }
     }
+}
+
+// 整图 uint4 拷贝（原地路径用）
+__global__ void m3_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
+                                 uint8_t* __restrict__ d, size_t dstep, int W)
+{
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    const int y = blockIdx.y;
+    const uint8_t* sp = s + (size_t)y * sstep;
+    uint8_t* dp = d + (size_t)y * dstep;
+    if (x + 16 <= W) {
+        *(uint4*)(dp + x) = *(const uint4*)(sp + x);
+    } else if (x < W) {
+        for (int i = x; i < W; ++i) dp[i] = sp[i];
+    }
+}
+
+void mean3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                 int width, int height, int TH, cudaStream_t stream)
+{
+    int th = ((width + 15) / 16 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    const int gxx = (width + 16 * th - 1) / (16 * th);
+    const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : (TH <= 32 ? 32 : 64));
+    dim3 g(gxx, (height + th3 - 1) / th3);
+    if (th3 == 8)       mean3_fuse_kernel<8><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    else if (th3 == 16) mean3_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    else if (th3 == 32) mean3_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    else                mean3_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
 }
 
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
@@ -167,10 +250,27 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
 {
     const float inv_area = 1.0f / (float)(kw * kh);
     if (kw == 3 && kh == 3) {
-        // k=3 单遍直加：有效流量 ~2B/px，远胜两遍分离法的 6B/px
-        dim3 g(idiv_up(width, 32), idiv_up(height, 8)), t(256);
-        mean3_direct_kernel<<<g, t, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area);
-        return;
+        // k=3 单遍融合：out-of-place 单内核；in-place 融合写 workspace 再整图拷回（4B/px）。
+        // 仅接受 W%16==0 且 16B 对齐；其它宽度/对齐回退两遍分离路径（结果一致）。
+        const bool inplace = ((const void*)d_src == (const void*)d_dst);
+        const bool fuse3 = (width >= 16 && width <= 4096 && (width % 16 == 0) &&
+                            (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                            ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+        if (fuse3) {
+            const int TH = height <= 1200 ? 16 : 64;
+            if (inplace) {
+                const int tstep = (width + 15) & ~15;
+                uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+                mean3_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
+                int th = ((width + 15) / 16 + 31) / 32 * 32;
+                if (th > 256) th = 256;
+                dim3 gc((width + 16 * th - 1) / (16 * th), height);
+                m3_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            } else {
+                mean3_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+            }
+            return;
+        }
     }
     const size_t tstep = (size_t)width * 2;
     uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);

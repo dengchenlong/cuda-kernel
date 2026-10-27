@@ -93,12 +93,23 @@ G:\cuda-kernel
         720p k=5 偶发 0.97x（±3% 计时噪声），其余全 WIN（1.0~1.8x）
       - smoke 新增 f32 全算子组（all pass），bench 新增 f32 组 22 项（119 WIN / 1 噪声 lose）
 - [x] 全部算子稳定 ≥1（2026-09-28 达成，全算子×全尺寸×全参数 WIN，最低 1.087x）
-- [ ] 下一步（2026-10-27 r41 后）：最弱项已转到 **mean k=3（4K 1.13x / 1080p 1.19x / 720p 1.30x）**
-      与 gaussian-f32 k=5（1.25~1.31x）。mean k=3 的 1.10ms@4K 和 morph 优化前同源（两遍 + 32400 个小
-      block），按同样思路做单遍融合：16 px/线程、uint4、垂直 3 行滚动 + 水平 3 邻域；差别是窗口和
-      ≤765 要用 16-bit —— 用 `__byte_perm` 把字节拆成 16-bit lane + `__vadd2` 做加，
-      除 9 用定点 `(v*7282+32768)>>16`（对 v≤2295 与 round(v/9) 逐值等价）。原地同样走
-      「融合写 workspace + 拷回」（benchmark 是原地口径）。
+- [x] 下一步（2026-10-27 r41 后 → 2026-10-28 r42 完成）：**mean k=3 单遍融合**（BENCHMARK.md 第十一轮）
+      - 旧 `mean3_direct_kernel`（32x8 smem tile + 每像素 9 次 smem 字节读）4K 1.10ms 只有 7.5 GB/s，
+        且 halo 从 global 读 → **原地调用有跨 block 竞态**（probe_m3a：4K 69 万像素错、maxdiff 48；
+        smoke 只测 out-of-place 所以多年没抓到）。
+      - 新 `mean3_fuse_kernel`：16 px/线程、uint4、`__byte_perm` 展开 u16 lane + `__funnelshift_r`
+        取左右邻 + `__vadd2`；垂直 3 行滚动；`(v*7282+32768)>>16` 除 9（0..2295 全量等价，probe 验证）；
+        原地走 workspace + 整图 uint4 拷回。44 regs 无 spill。
+      - **求和不能沿用 morph 的 clamp 边界**：min/max 的 min(a,a,b)==min(a,b) 让 clamp 蒙混过关，
+        求和必须 REFLECT_101 镜像（左右取像素 1 / W-2，上下取 row 1 / H-2），否则 4K 11307 px 错、
+        maxdiff 66。改镜像后 maxdiff=0，probe_m3b 80 用例（含极扁图/非 16 倍数宽回退/tight+4/in-place）全过。
+      - smoke 新增 mean k=3/15/31 的 **in-place 三条用例**，防止这类「只在原地口径暴露」的 bug 再溜过去。
+      - 结果：mean k=3 1.13~1.30x → **2.60~3.25x**；r42 全量 120/120 WIN 零 lose，min 1.235x，中位 4.49x。
+- [ ] 下一步（2026-10-28 r42 后）：最弱项已转到 **mean-f32 k=3（1.24~1.34x）** 与
+      **gaussian k=5 / gaussian-f32 k=5（1.26~1.36x）**。优先做 gaussian k=5 的 u8 路径：
+      先 probe 量「每行读放大 + 两次 kernel vs 单遍融合」的成本分布（k=5 是 5 行窗口，
+      单遍融合要多 4 行 halo，TH 够大时才划算）；mean-f32 k=3 可复用本轮融合思路但原地 16B/px
+      流量把理论收益压到 ~1.4x，排在后面。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
@@ -207,6 +218,22 @@ G:\cuda-kernel
   每线程固定一列滚 16 行（tile 行跨 258B）→ smoke 全绿但性能回归 0.21~0.40x（4K 1.667ms
   vs OpenCV 0.357ms，原实现 1.13~1.17x），不要再走这条方向；该 run 同时已落地 morph k=3
   融合内核（0d305d0）。
+- 优化（2026-10-28，r42）：mean k=3 单遍融合（u16 lane 打包），全尺寸 1.13~1.30x → 2.60~3.25x（BENCHMARK.md 第十一轮）。
+  - 病灶：旧 mean3_direct_kernel 是 32x8 smem tile（4K 32400 个小 block、每像素 9 次 smem 字节读），
+    4K 1.10ms = 7.5 GB/s；且 tile halo 从 global 读 → 原地（benchmark 口径）跨 block 竞态，
+    probe_m3a 实测 4K 69 万像素错 maxdiff 48（smoke 只测 out-of-place，所以一直没抓到）。
+  - 定案：16 px/线程 + uint4；`__byte_perm(w,0,0x4140/0x4342)` 把 4 字节拆成 2 个 u16 lane 字，
+    水平 3 邻域用 `__funnelshift_r(e[k-1],e[k],16)` + `__vadd2`；垂直 3 行滚动 hp/hc/hn 各 8 字；
+    除 9 用 `(v*7282+32768)>>16`（v≤2295 与 round(v/9) 全量等价）；44 regs、无 spill。
+    原地 = 融合写 workspace（16 对齐紧排）+ 整图 uint4 拷回，4B/px。
+  - **求和边界必须 REFLECT_101 镜像**：morph 那套 clamp 边界在 min/max 下等价（min(a,a,b)==min(a,b)），
+    对求和不等价 —— 首版 clamp 导致 4K 11307 px 错 maxdiff 66；改成左右取像素 1/W-2、上下取 row 1/H-2 后 maxdiff=0。
+  - 约束：W%16==0 且 W≤4096 且基址/pitch 16B 对齐走融合；其余（含所有奇数宽）回退两遍路径，该路径原地安全。
+  - 验证：probe_m3a（四档 × in/out-of-place）全 0 diff；probe_m3b 80 用例（16x1/16x2/32x1/48x5/63x64/
+    100x100/127x129/1279x720 等 × pitch/tight+4 × in-place/out-of-place）全过 + DIV9_CHECK 全量 OK；
+    smoke 120 [OK] 全绿（新增 mean k=3/15/31 in-place 三条用例）。
+  - 巡检 r42：120/120 WIN 零 lose，min 1.235（mean-f32 640 k=3），中位 4.49x，p10 1.41x；
+    CSV 落库 docs/bench/bench_sm61_r42.csv。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
