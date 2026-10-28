@@ -9,7 +9,7 @@ u8 组最低 1.09x、最高 21.8x；f32 组 118/119 项 WIN，详见 [BENCHMARK.
 | 算子 | u8 接口 | f32 接口 | 算法 |
 |---|---|---|---|
 | 积分图 | `gpu_integral` u8 → u32 inclusive | `gpu_integral_f32`（OpenCV-CUDA 无此 API） | 分块 scan + 跨块加偏移 |
-| 均值滤波 | `gpu_mean` 任意核 | `gpu_mean_f32` | k=3 单遍 smem 直加；其余两遍分离（行前缀 → 列归一化），O(1)/像素 |
+| 均值滤波 | `gpu_mean` 任意核 | `gpu_mean_f32` | k=3 单遍融合（16px/线程 uint4 + u16 lane `__byte_perm`/`__vadd2` + 滚动垂直，原地走 workspace）；其余两遍分离（行前缀 → 列归一化），O(1)/像素 |
 | 腐蚀/膨胀 | `gpu_erode` / `gpu_dilate` 任意矩形核，二值+灰度 | `gpu_erode_f32` / `gpu_dilate_f32` | k=3 单遍融合（16px/线程 uint4 + vminu4/funnelshift 水平 + 滚动垂直）；k=5,7 两遍直加；k≥9 van Herk/Gil-Werman O(1)/像素 |
 | 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | 分离两遍（smem tile + smem ring）；k=5/7 固定核走定点整数路径 |
 | 灰度直方图 | `gpu_histogram` 256 bins | — | uint4 合并读 + smem 私有 hist + last-block 归约（免预清零、免全局原子） |
@@ -86,7 +86,7 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 | 算子 | 640x480 | 1280x720 | 1920x1080 | 3840x2160 |
 |---|---|---|---|---|
 | integral | **11.8x** | **6.2x** | **4.4x** | **2.9x** |
-| mean k=3 / k=31 | **2.0x / 17.7x** | **1.9x / 17.5x** | **1.5x / 18.7x** | **1.3x / 21.5x** |
+| mean k=3 / k=31 | **2.6x / 18.5x** | **3.3x / 18.0x** | **2.6x / 19.9x** | **2.8x / 21.8x** |
 | erode/dilate k=3~31 | **2.9~15.5x** | **3.8~13.3x** | **3.5~11.0x** | **3.7~12.1x** |
 | gaussian k=5 / k=15 | **1.6x / 1.3x** | **1.4x / 1.5x** | **1.4x / 1.6x** | **1.4x / 1.7x** |
 | hist gray / binary | **3.8x / 4.8x** | **3.2x / 7.1x** | **2.3x / 5.5x** | **1.5x / 7.1x** |
@@ -95,7 +95,7 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 | gaussian-f32 k=15 | **1.3x** | **1.6x** | **1.6x** | **1.8x** |
 
 完整逐项数字（六轮基线）见 [BENCHMARK.md](BENCHMARK.md)，优化过程记录见 [PROGRESS.md](PROGRESS.md)。
-注：hist 行为第九轮（2026-10-26）重测值（两条路径重写后），其余行仍是第五轮基线。
+注：hist 行为第九轮（2026-10-26）重测值，mean 行为第十一轮（2026-10-28 r42）重测值，其余行仍是第五轮基线。
 
 ## 优化经验（踩坑总结）
 

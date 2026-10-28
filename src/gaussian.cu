@@ -8,6 +8,8 @@
 
 namespace {
 
+typedef unsigned int uint;   // Windows 下 CUDA 头不保证提供 uint
+
 constexpr int MAX_K = 31;
 constexpr int R_THREADS = 256;   // 行遍 block 线程
 constexpr int C_THREADS = 256;   // 列遍 block 线程（=256 列/块）
@@ -363,6 +365,147 @@ void* ws_grow(size_t need) {
 }
 inline int idiv_up(int a, int b) { return (a + b - 1) / b; }
 
+// ---------------- k=5 固定核单遍融合（2026-10-29）----------------
+// 两遍路径（rows u8→u16 写 2B/px、cols 读 2B/px）在 4K 要过 4 次全图流量：读 1B + 写 2B +
+// 读 2B + 写 1B = 6B/px，实测 1.39ms 只有 36 GB/s（纯 uint4 拷贝天花板 93 GB/s）。
+// 本内核单遍完成：16 像素/线程、uint4 取数；水平 5-tap 在 u16 lane 上做（__byte_perm 把 4 字节
+// 拆成 2 个 lane 字，±1 邻用 __funnelshift_r，±2 邻直接取相邻 lane 字，__vadd2 加），
+// 垂直 5 行滚动寄存器；权重 [1,4,6,4,1]⊗[1,4,6,4,1]，总和 256。
+// 输出 (S + 127 + ((S>>8)&1)) >> 8 —— 与 __float2int_rn(S/256) 全量等价（round-half-even；
+// S ≤ 256*255 = 65280 恒成立），与两遍定点路径逐位一致。
+// 边界水平/垂直都按 BORDER_REFLECT_101（求和不能用 clamp —— min/max 能糊弄 clamp，
+// 加法不行，见 mean k=3 的教训）。
+// 约束：W%16==0 且 16<=W<=4096（单块覆盖整行）、16B 对齐、H>=1；其它回退两遍路径。
+__device__ __forceinline__ int g5_mirror(int i, int len)
+{
+    if (len <= 1) return 0;
+    const int per = 2 * len - 2;
+    i %= per;
+    if (i < 0) i += per;
+    return (i < len) ? i : (per - i);      // REFLECT_101：H=2 时 y=3 要折两次回到 1
+}
+
+template <int TH>
+__global__ void gauss5_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int H)
+{
+    const int tid  = threadIdx.x;
+    const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (gx < W);
+    const int gxl  = act ? gx : ((W - 16) & ~15);   // 非活跃线程给 16B 对齐安全地址，仍参与 shuffle
+
+    uint h[5][8];
+
+    // 一行 16 字节的水平 5-tap 和（u16 lane，≤4080）
+    auto hrow = [&](int ry, uint o[8]) {
+        const uint8_t* rp = src + (size_t)ry * sstep;
+        const uint4 w = *(const uint4*)(rp + gxl);
+        uint e[9];
+        e[0] = __byte_perm(w.x, 0, 0x4140);     // lane0 = px0, lane1 = px1
+        e[1] = __byte_perm(w.x, 0, 0x4342);     // lane0 = px2, lane1 = px3
+        e[2] = __byte_perm(w.y, 0, 0x4140);
+        e[3] = __byte_perm(w.y, 0, 0x4342);
+        e[4] = __byte_perm(w.z, 0, 0x4140);
+        e[5] = __byte_perm(w.z, 0, 0x4342);
+        e[6] = __byte_perm(w.w, 0, 0x4140);
+        e[7] = __byte_perm(w.w, 0, 0x4342);
+        // 邻线程 halo：左 = 前一线程最后两像素（正是它的 e[7]），右 = 后一线程前两像素（e[0]）
+        uint prv = __shfl_up_sync(0xffffffffu, e[7], 1);
+        uint nxt = __shfl_down_sync(0xffffffffu, e[0], 1);
+        // 跨 warp/图像边界必须自己取：注意 u16 lane 布局是「每字节占一个 lane」，
+        // 不能用 *(uint16_t*) 直接读（那会把两个字节压进同一个 lane 的 0..15 位）
+        if (lane == 0)
+            // gxl==0：x=-2 镜像到 x=2（e[1].lane0），x=-1 镜像到 x=1（e[0].lane1）
+            prv = (gxl == 0) ? ((e[1] & 0xffffu) | ((e[0] >> 16) & 0xffffu) << 16)
+                             : ((uint)rp[gxl - 2] | ((uint)rp[gxl - 1] << 16));
+        if (lane == 31 || gxl + 16 >= W)
+            nxt = (gxl + 16 >= W) ? ((e[7] & 0xffffu) | (((e[6] >> 16) & 0xffffu) << 16))
+                                  : ((uint)rp[gxl + 16] | ((uint)rp[gxl + 17] << 16));
+        e[8] = nxt;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint A  = (k == 0) ? prv : e[k - 1];
+            const uint C  = e[k + 1];
+            const uint L1 = __funnelshift_r(A, e[k], 16);     // v(x-1) 两个 lane
+            const uint R1 = __funnelshift_r(e[k], C, 16);     // v(x+1)
+            const uint t  = __vadd2(L1, R1);                                  // ≤510
+            const uint t4 = __vadd2(__vadd2(t, t), __vadd2(t, t));            // 4t
+            const uint c  = __vadd2(__vadd2(e[k], e[k]), e[k]);
+            const uint c6 = __vadd2(c, c);                                    // 6E
+            o[k] = __vadd2(__vadd2(__vadd2(A, C), t4), c6);
+        }
+    };
+
+    // 预载 y0-2 .. y0+2（行号按 REFLECT_101 镜像）
+#pragma unroll
+    for (int i = 0; i < 5; ++i) hrow(g5_mirror(y0 - 2 + i, H), h[i]);
+
+    for (int y = y0; y < y1; ++y) {
+        uint hn[8];
+        hrow(g5_mirror(y + 3, H), hn);      // 下一轮的最下行（本轮窗口是 y-2..y+2）
+        if (act) {
+            uint p[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const uint b  = __vadd2(h[1][k], h[3][k]);
+                const uint b4 = __vadd2(__vadd2(b, b), __vadd2(b, b));        // 4(h1+h3)
+                const uint c  = __vadd2(__vadd2(h[2][k], h[2][k]), h[2][k]);
+                const uint c6 = __vadd2(c, c);                                // 6h2
+                const uint S  = __vadd2(__vadd2(__vadd2(h[0][k], h[4][k]), b4), c6);
+                // round-half-even(S/256)，与 __float2int_rn 全量等价
+                const uint adj = __vadd2((S >> 8) & 0x00010001u, 0x007f007fu);
+                p[k] = __byte_perm(__vadd2(S, adj), 0, 0x4431);               // 每 lane >>8
+            }
+            uint4 o;
+            // p[k] 已是「两字节紧排」= l0 | l1<<8，四像素再拼一次
+            o.x = __byte_perm(p[0], p[1], 0x5410);
+            o.y = __byte_perm(p[2], p[3], 0x5410);
+            o.z = __byte_perm(p[4], p[5], 0x5410);
+            o.w = __byte_perm(p[6], p[7], 0x5410);
+            *(uint4*)(dst + (size_t)y * dstep + gx) = o;
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            h[0][k] = h[1][k]; h[1][k] = h[2][k]; h[2][k] = h[3][k];
+            h[3][k] = h[4][k]; h[4][k] = hn[k];
+        }
+    }
+}
+
+// 整图 uint4 拷贝（原地路径用：融合先写 workspace，再拷回 dst）
+__global__ void g5_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
+                                 uint8_t* __restrict__ d, size_t dstep, int W)
+{
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    const int y = blockIdx.y;
+    const uint8_t* sp = s + (size_t)y * sstep;
+    uint8_t* dp = d + (size_t)y * dstep;
+    if (x + 16 <= W) {
+        *(uint4*)(dp + x) = *(const uint4*)(sp + x);
+    } else if (x < W) {
+        for (int i = x; i < W; ++i) dp[i] = sp[i];
+    }
+}
+
+void gauss5_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                  int width, int height, int TH, cudaStream_t stream)
+{
+    int th = ((width + 15) / 16 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    dim3 g(idiv_up(width, 16 * th), idiv_up(height, TH));
+    switch (TH) {
+    case 8:  gauss5_fuse_kernel<8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 16: gauss5_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 32: gauss5_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    default: gauss5_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    }
+}
+
 } // anonymous namespace
 
 // host: 与 OpenCV getGaussianKernel(ksize, sigma, CV_32F) 完全一致的权重
@@ -418,6 +561,29 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
 
     // k=5 固定核（sigma<=0）走定点整数路径：u16 tmp 带宽减半，逐位结果不变
     if (ksize == 5 && sigma <= 0.f) {
+        // 单遍融合（2026-10-29）：W%16==0 + 16B 对齐时直接一遍出图（6B/px → 2.1B/px）。
+        // 原地（dst==src）融合先写 workspace 再整图 uint4 拷回（4.1B/px），仍然远低于两遍路径。
+        // 其它宽度/对齐回退下面的两遍 u16 定点路径，结果逐位一致。
+        const bool inplace = ((const void*)d_src == (const void*)d_dst);
+        const bool fuse5 = (width >= 16 && width <= 4096 && (width % 16 == 0) &&
+                            (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                            ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+        if (fuse5) {
+            const int TH = (height >= 1600) ? 64 : (height > 800 ? 16 : 8);
+            if (inplace) {
+                const int tstep = (width + 15) & ~15;
+                uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+                gauss5_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
+                int th = ((width + 15) / 16 + 31) / 32 * 32;
+                if (th > 256) th = 256;
+                if (th < 32)  th = 32;
+                dim3 gc(idiv_up(width, 16 * th), height);
+                g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            } else {
+                gauss5_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+            }
+            return;
+        }
         const size_t tstep = (size_t)width * 2;
         uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
         {
