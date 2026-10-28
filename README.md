@@ -1,8 +1,8 @@
 # cuda-kernel — 高性能 CUDA 图像算子库（对标 OpenCV-CUDA）
 
 一组针对 Pascal (sm_61) 手工优化的单通道图像算子，支持 **CV_8U 与 CV_32F** 两种输入格式。
-性能全面超过同机同卡的 OpenCV-CUDA 4.1.30 基准（全部算子 × 全部尺寸 × 全部参数 WIN，
-u8 组最低 1.09x、最高 21.8x；f32 组 118/119 项 WIN，详见 [BENCHMARK.md](BENCHMARK.md)）。
+性能全面超过同机同卡的 OpenCV-CUDA 4.1.30 基准（r43 全量 120 项全 WIN：u8 组 1.27~22.0x、
+f32 组 1.25~19.7x，详见 [BENCHMARK.md](BENCHMARK.md)）。
 
 ## 算子
 
@@ -11,7 +11,7 @@ u8 组最低 1.09x、最高 21.8x；f32 组 118/119 项 WIN，详见 [BENCHMARK.
 | 积分图 | `gpu_integral` u8 → u32 inclusive | `gpu_integral_f32`（OpenCV-CUDA 无此 API） | 分块 scan + 跨块加偏移 |
 | 均值滤波 | `gpu_mean` 任意核 | `gpu_mean_f32` | k=3 单遍融合（16px/线程 uint4 + u16 lane `__byte_perm`/`__vadd2` + 滚动垂直，原地走 workspace）；其余两遍分离（行前缀 → 列归一化），O(1)/像素 |
 | 腐蚀/膨胀 | `gpu_erode` / `gpu_dilate` 任意矩形核，二值+灰度 | `gpu_erode_f32` / `gpu_dilate_f32` | k=3 单遍融合（16px/线程 uint4 + vminu4/funnelshift 水平 + 滚动垂直）；k=5,7 两遍直加；k≥9 van Herk/Gil-Werman O(1)/像素 |
-| 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | 分离两遍（smem tile + smem ring）；k=5/7 固定核走定点整数路径 |
+| 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | k=5 单遍融合（16px/线程 uint4 + u16 lane 5-tap + 5 行滚动，原地走 workspace）；k=7 定点整数两遍；其余分离两遍（smem tile + smem ring） |
 | 灰度直方图 | `gpu_histogram` 256 bins | — | uint4 合并读 + smem 私有 hist + last-block 归约（免预清零、免全局原子） |
 | 二值直方图 | `gpu_histogram_binary` | — | popcount 直数 0/255 + last-block 归约 |
 
@@ -88,14 +88,15 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 | integral | **11.8x** | **6.2x** | **4.4x** | **2.9x** |
 | mean k=3 / k=31 | **2.6x / 18.5x** | **3.3x / 18.0x** | **2.6x / 19.9x** | **2.8x / 21.8x** |
 | erode/dilate k=3~31 | **2.9~15.5x** | **3.8~13.3x** | **3.5~11.0x** | **3.7~12.1x** |
-| gaussian k=5 / k=15 | **1.6x / 1.3x** | **1.4x / 1.5x** | **1.4x / 1.6x** | **1.4x / 1.7x** |
+| gaussian k=5 / k=15 | **2.5x / 2.1x** | **2.6x / 2.6x** | **3.0x / 2.7x** | **3.3x / 2.8x** |
 | hist gray / binary | **3.8x / 4.8x** | **3.2x / 7.1x** | **2.3x / 5.5x** | **1.5x / 7.1x** |
 | mean-f32 k=31 | **11.2x** | **16.5x** | **16.9x** | **19.2x** |
 | erode/dilate-f32 k=3~31 | **2.3~12.2x** | **2.6~12.1x** | **2.6~12.5x** | **2.6~11.9x** |
 | gaussian-f32 k=15 | **1.3x** | **1.6x** | **1.6x** | **1.8x** |
 
 完整逐项数字（六轮基线）见 [BENCHMARK.md](BENCHMARK.md)，优化过程记录见 [PROGRESS.md](PROGRESS.md)。
-注：hist 行为第九轮（2026-10-26）重测值，mean 行为第十一轮（2026-10-28 r42）重测值，其余行仍是第五轮基线。
+注：hist 行为第九轮（2026-10-26）、mean 行为第十一轮（2026-10-28 r42）、gaussian 行为第十二轮
+（2026-10-29 r43）重测值，其余行仍是第五轮基线。
 
 ## 优化经验（踩坑总结）
 
@@ -109,6 +110,11 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 - **小核别套两遍分离**：k=3 均值两遍法的 tmp 往返 4B/px 是大头，单遍 smem 直加 ~2B/px 快 1.5 倍。
 - **定点整数可替代 float 中间缓冲**：dyadic 核（[1,4,6,4,1]/16、[2,7,14,18,14,7,2]/64）下
   整数 MAC + ×(1/2^n) 逐位一致且带宽减半；注意不能拿「未缩放行和 × 缩放后权重」（会按 2^n 倍饱和）。
+- **u16 lane 打包的两个陷阱**：① lane 布局是「每个字节占一个 16 位 lane」，
+  跨 warp/边界取 2 个邻字节时**不能** `*(const uint16_t*)` 直接读（那会把两字节压进同一 lane 的
+  0..15 位，warp 边界每行错 4 像素），必须按字节拼 `b0 | (b1 << 16)`；② 垂直镜像要周期式
+  （`per = 2H-2`、`i %= per`），单次折叠 + clamp 在 H=2 这类极扁图上会错。
+  参考实现：gaussian k=5 / mean k=3 / morph k=3 的单遍融合内核。
 - **两遍分离的列遍不能原地读写输出**：行分块后上方 chunk 的输出会被下方 chunk 当输入读，block 间无同步 → 竞态。
 - warp 内 ILP 取数变体（16B load stride 32B）会破坏合并访存，慢 7 倍；smem 原子冲突在随机数据下不是瓶颈。
 

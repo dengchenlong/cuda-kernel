@@ -105,11 +105,18 @@ G:\cuda-kernel
         maxdiff 66。改镜像后 maxdiff=0，probe_m3b 80 用例（含极扁图/非 16 倍数宽回退/tight+4/in-place）全过。
       - smoke 新增 mean k=3/15/31 的 **in-place 三条用例**，防止这类「只在原地口径暴露」的 bug 再溜过去。
       - 结果：mean k=3 1.13~1.30x → **2.60~3.25x**；r42 全量 120/120 WIN 零 lose，min 1.235x，中位 4.49x。
-- [ ] 下一步（2026-10-28 r42 后）：最弱项已转到 **mean-f32 k=3（1.24~1.34x）** 与
-      **gaussian k=5 / gaussian-f32 k=5（1.26~1.36x）**。优先做 gaussian k=5 的 u8 路径：
-      先 probe 量「每行读放大 + 两次 kernel vs 单遍融合」的成本分布（k=5 是 5 行窗口，
-      单遍融合要多 4 行 halo，TH 够大时才划算）；mean-f32 k=3 可复用本轮融合思路但原地 16B/px
-      流量把理论收益压到 ~1.4x，排在后面。
+- [ ] 下一步（2026-10-29 r43 后）：弱项已收敛到 4 个：gaussian k=7（1.27~1.61x）、
+      gaussian-f32 k=5（1.25~1.34x）、mean-f32 k=3（1.27~1.35x）、hist-gray 4K（1.38x）。按性价比：
+      1) **gaussian k=7 套同一套 u16 lane 融合**（权重 [2,7,14,18,14,7,2]/4096；水平 7-tap 多两组 lane 字、
+         垂直 7 行滚动；每 lane 行和 ≤16320、总和 ≤1,044,480 → u16 装不下，垂直和要用 u32 lane 或
+         分两级 u16 累加，注意别溢出）。预计同量级收益（1.3~1.6x → 2.5x+）。
+      2) **原地路径改 smem tile 版融合**（去掉 workspace 拷贝）：block 覆盖 1024px × TH=8 行，
+         tile 含 ±2 halo 行共 12 行全放 smem（1024+4 B/行 ≈ 12.3KB），先装载 → 一次 __syncthreads →
+         计算写 dst。流量 2.5B/px 且原地天然安全（源数据全部先入 smem），预计 4K 原地 0.54 → ~0.24ms。
+         注意 smem 装载也要按 16 对齐读，halo 列用镜像。
+      3) gaussian-f32 k=5 / mean-f32 k=3 走 f32 版单遍融合（f32 无定点，窗口和直接用 float，
+         但原地 4B/px 输入+输出、理论收益 ~1.4x，排最后）。
+      4) hist-gray 4K 1.38x 属 ~0.1ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x，见历史），不单独开 spike。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
@@ -237,6 +244,21 @@ G:\cuda-kernel
   - 顺带体检其它算子的原地口径（probe_ipall：gaussian k=5/7/15、mean k=15/31、erode k=15/31 ×
     640/1080p/4K，共 21 组）：in-place 与 out-of-place **逐位一致（diff=0）**，说明只有旧 mean k=3
     那条路径有竞态，其余原地路径（靠 static workspace 分离两遍）都是安全的。
+- 优化（2026-10-29，r43）：gaussian k=5 单遍融合（u16 lane 打包），全尺寸 1.29~1.41x → 2.52~3.35x（BENCHMARK.md 第十二轮）。
+  - 病灶：两遍定点路径（rows u8→u16 写 2B/px + cols u16→u8 读 2B/px）4K 全图流量 6B/px，
+    1.3926ms 只有 36 GB/s（纯拷贝天花板 93 GB/s / 0.178ms）。
+  - 定案：16 px/线程 uint4；`__byte_perm(w,0,0x4140/0x4342)` 拆 u16 lane（每 lane 一个字节）；
+    水平 5-tap = `A + C + 4*(L1+R1) + 6*E`（±2 邻取相邻 lane 字、±1 邻 `__funnelshift_r`，全 `__vadd2`，
+    每 lane ≤4080 不溢出）；垂直 5 行滚动 `h[5][8]`；输出 `(S+127+((S>>8)&1))>>8`
+    与 `__float2int_rn(S/256)` 全量等价（round-half-even，S≤65280），与两遍路径逐位一致。
+  - 三个坑（都靠 probe 抓到）：① 跨 warp halo **不能用 `*(uint16_t*)` 读**——那会把两字节压进同一 lane
+    的 0..15 位，warp 边界每行错 4 像素（x=510..513 条带）；按字节拼 lane 才对。
+    ② 垂直镜像必须周期式（`per=2H-2`, `i%=per`）：H=2 时 y=3 要折两次回 1，单次折叠 + clamp 会错。
+    ③ 左边界镜像的两个 lane 是 (px2, px1)（来自 e[1].lane0 / e[0].lane1），不是 (px1, px0)。
+  - 原地：融合写 workspace + 整图 uint4 拷回（4.1B/px）；4K in-place 0.5437 vs out-of-place 0.3779，
+    差值 0.166ms ≈ copy16 0.184ms，即原地多出来的就是那一遍拷贝。
+  - 验证：probe_g5d 常量/斜坡/冲激 maxdiff=0；probe_g5f 69 用例（23 形状 × in/out/紧排）全 0；
+    smoke 120 [OK]；r43 全量 120/120 WIN 零 lose，min 1.253，中位 4.49x，CSV 落库 docs/bench/bench_sm61_r43.csv。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
