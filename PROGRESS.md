@@ -105,18 +105,31 @@ G:\cuda-kernel
         maxdiff 66。改镜像后 maxdiff=0，probe_m3b 80 用例（含极扁图/非 16 倍数宽回退/tight+4/in-place）全过。
       - smoke 新增 mean k=3/15/31 的 **in-place 三条用例**，防止这类「只在原地口径暴露」的 bug 再溜过去。
       - 结果：mean k=3 1.13~1.30x → **2.60~3.25x**；r42 全量 120/120 WIN 零 lose，min 1.235x，中位 4.49x。
-- [ ] 下一步（2026-10-29 r43 后）：弱项已收敛到 4 个：gaussian k=7（1.27~1.61x）、
-      gaussian-f32 k=5（1.25~1.34x）、mean-f32 k=3（1.27~1.35x）、hist-gray 4K（1.38x）。按性价比：
-      1) **gaussian k=7 套同一套 u16 lane 融合**（权重 [2,7,14,18,14,7,2]/4096；水平 7-tap 多两组 lane 字、
-         垂直 7 行滚动；每 lane 行和 ≤16320、总和 ≤1,044,480 → u16 装不下，垂直和要用 u32 lane 或
-         分两级 u16 累加，注意别溢出）。预计同量级收益（1.3~1.6x → 2.5x+）。
-      2) **原地路径改 smem tile 版融合**（去掉 workspace 拷贝）：block 覆盖 1024px × TH=8 行，
-         tile 含 ±2 halo 行共 12 行全放 smem（1024+4 B/行 ≈ 12.3KB），先装载 → 一次 __syncthreads →
-         计算写 dst。流量 2.5B/px 且原地天然安全（源数据全部先入 smem），预计 4K 原地 0.54 → ~0.24ms。
-         注意 smem 装载也要按 16 对齐读，halo 列用镜像。
-      3) gaussian-f32 k=5 / mean-f32 k=3 走 f32 版单遍融合（f32 无定点，窗口和直接用 float，
-         但原地 4B/px 输入+输出、理论收益 ~1.4x，排最后）。
-      4) hist-gray 4K 1.38x 属 ~0.1ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x，见历史），不单独开 spike。
+- [x] 下一步（2026-10-29 r43 后 → 2026-10-31 r44 完成）：gaussian k=7 单遍融合（BENCHMARK.md 第十三轮）
+      - 病灶：两遍定点路径 6B/px，4K 1.5718ms 只有 31.7 GB/s（拷贝天花板 93 GB/s / 0.183ms）。
+      - 定案 `gauss7_fuse_kernel`：8 px/线程 + uint2 取数；**水平 7-tap 用 `__dp4a`**
+        （sm_61 起支持 u8x4 无符号点积，每像素 2 条 = 7 tap 拆 4+3、末位权重 0；窗口字由
+        12 条 `funnelshift_r` 从同一批 uint2 错位重排得到），**垂直必须 u32 lane**
+        （Σ w_j h_j ≤ 64×16320 = 1,044,480 > 65535，k=5 的 `__vadd2` u16 双 lane 打包会溢出），
+        `h[7][8]` 滚动窗口 + IMAD 立即数权重；输出 `__float2int_rn(S × 2^-12)` 与两遍路径逐位一致。
+      - 原地：融合写 workspace + 整图 uint4 拷回（4.1B/px）；4K 原地 0.63 vs out-of-place 0.46。
+      - 验证：probe_g7f **95 条断言全过**（19 形状 × {out/in-place, 紧排}，双参照：OpenCV-CUDA +
+        本机 int64 精确参考 round-half-even(S/4096)，都要求 diff=0）；常量 0/1/127/128/255 极值 diff=0
+        （全 255 恰达 S 上限）；smoke 120 [OK]。
+      - **角落发现（既有行为）**：H<4 时旧两遍路径的「单次折叠 + clamp」与 REFLECT_101 周期镜像
+        本就不等价（8x2 vs OpenCV diff=10、8x3 diff=3），融合路径对 H=3 也会差 3 → 融合加 **H>=4**
+        门槛，H<4 保持旧输出不变（不为非 benchmark 角落改既有行为）。
+      - 结果：k=7 1.27~1.61x → **3.20~3.73x**；r44 全量 120/120 WIN 零 lose，min 1.237，中位 4.509x，
+        p10 2.156x，CSV 落 docs/bench/bench_sm61_r44.csv。
+- [ ] 下一步（2026-10-31 r44 后）：弱项只剩两组 f32 分离路径 + 1 个噪声项，按性价比：
+      1) **原地路径改 smem tile 融合，去掉 workspace 拷贝**：block 覆盖 1024px × TH=8 行，tile 含
+         ±3 halo 共 TH+6 行（k=5 是 ±2）、1024×1B + 边界列 ≈ 10KB；先装载 → 一次 __syncthreads →
+         计算写 dst。流量 2.5B/px 且原地天然安全（源数据全部先入 smem），预计 4K 原地
+         k=5 0.54 → ~0.30ms、k=7 0.63 → ~0.48ms。注意 smem 装载按 16 对齐、halo 列用镜像，
+         且 block 内行带之间不能跨 block 重叠 halo（同一 block 覆盖整段列才有意义）。
+      2) **gaussian-f32 k=5 / mean-f32 k=3 单遍 f32 融合**（f32 无定点，窗口和直接用 float；
+         输入输出 4B/px、原地 8B/px，理论收益 ~1.4x，排最后）。
+      3) hist-gray 4K 1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径

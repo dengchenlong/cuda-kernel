@@ -11,7 +11,7 @@ f32 组 1.25~19.7x，详见 [BENCHMARK.md](BENCHMARK.md)）。
 | 积分图 | `gpu_integral` u8 → u32 inclusive | `gpu_integral_f32`（OpenCV-CUDA 无此 API） | 分块 scan + 跨块加偏移 |
 | 均值滤波 | `gpu_mean` 任意核 | `gpu_mean_f32` | k=3 单遍融合（16px/线程 uint4 + u16 lane `__byte_perm`/`__vadd2` + 滚动垂直，原地走 workspace）；其余两遍分离（行前缀 → 列归一化），O(1)/像素 |
 | 腐蚀/膨胀 | `gpu_erode` / `gpu_dilate` 任意矩形核，二值+灰度 | `gpu_erode_f32` / `gpu_dilate_f32` | k=3 单遍融合（16px/线程 uint4 + vminu4/funnelshift 水平 + 滚动垂直）；k=5,7 两遍直加；k≥9 van Herk/Gil-Werman O(1)/像素 |
-| 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | k=5 单遍融合（16px/线程 uint4 + u16 lane 5-tap + 5 行滚动，原地走 workspace）；k=7 定点整数两遍；其余分离两遍（smem tile + smem ring） |
+| 高斯滤波 | `gpu_gaussian` k=1~31 | `gpu_gaussian_f32` | k=5 单遍融合（16px/线程 uint4 + u16 lane 5-tap + 5 行滚动，原地走 workspace）；k=7 单遍融合（8px/线程 uint2 + `__dp4a` 水平 7-tap + u32 lane 垂直 7 行滚动）；其余分离两遍（smem tile + smem ring） |
 | 灰度直方图 | `gpu_histogram` 256 bins | — | uint4 合并读 + smem 私有 hist + last-block 归约（免预清零、免全局原子） |
 | 二值直方图 | `gpu_histogram_binary` | — | popcount 直数 0/255 + last-block 归约 |
 
@@ -88,15 +88,15 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 | integral | **11.8x** | **6.2x** | **4.4x** | **2.9x** |
 | mean k=3 / k=31 | **2.6x / 18.5x** | **3.3x / 18.0x** | **2.6x / 19.9x** | **2.8x / 21.8x** |
 | erode/dilate k=3~31 | **2.9~15.5x** | **3.8~13.3x** | **3.5~11.0x** | **3.7~12.1x** |
-| gaussian k=5 / k=15 | **2.5x / 2.1x** | **2.6x / 2.6x** | **3.0x / 2.7x** | **3.3x / 2.8x** |
+| gaussian k=5 / k=7 / k=15 | **2.4x / 3.2x / 2.3x** | **2.6x / 3.5x / 2.6x** | **3.0x / 3.7x / 2.7x** | **3.3x / 3.6x / 2.8x** |
 | hist gray / binary | **3.8x / 4.8x** | **3.2x / 7.1x** | **2.3x / 5.5x** | **1.5x / 7.1x** |
 | mean-f32 k=31 | **11.2x** | **16.5x** | **16.9x** | **19.2x** |
 | erode/dilate-f32 k=3~31 | **2.3~12.2x** | **2.6~12.1x** | **2.6~12.5x** | **2.6~11.9x** |
 | gaussian-f32 k=15 | **1.3x** | **1.6x** | **1.6x** | **1.8x** |
 
 完整逐项数字（六轮基线）见 [BENCHMARK.md](BENCHMARK.md)，优化过程记录见 [PROGRESS.md](PROGRESS.md)。
-注：hist 行为第九轮（2026-10-26）、mean 行为第十一轮（2026-10-28 r42）、gaussian 行为第十二轮
-（2026-10-29 r43）重测值，其余行仍是第五轮基线。
+注：hist 行为第九轮（2026-10-26）、mean 行为第十一轮（2026-10-28 r42）、gaussian 行为第十三轮
+（2026-10-31 r44，k=5 与 k=7 均为单遍融合），其余行仍是第五轮基线。
 
 ## 优化经验（踩坑总结）
 
@@ -115,6 +115,14 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
   0..15 位，warp 边界每行错 4 像素），必须按字节拼 `b0 | (b1 << 16)`；② 垂直镜像要周期式
   （`per = 2H-2`、`i %= per`），单次折叠 + clamp 在 H=2 这类极扁图上会错。
   参考实现：gaussian k=5 / mean k=3 / morph k=3 的单遍融合内核。
+- **sm_61 上 `__dp4a`（u8x4 点积）是水平 tap 的利器**：7-tap 每像素只要 2 条 dp4a
+  （拆 4+3、末位权重 0），操作数由 `funnelshift_r` 从同一批 `uint2` 错位重排得到——
+  8 像素 = 12 条移位 + 16 条 dp4a，远低于展开成 IMAD。但**垂直方向不能沿用 u16 双 lane 打包**：
+  权重和 64 时 `Σ w_j h_j ≤ 64×16320 = 1,044,480 > 65535` 会溢出，必须退回 u32 lane
+  （k=5 那种权重和 256、单 lane ≤4080 的量级才装得下）。参考实现：gaussian k=7 的 `gauss7_fuse_kernel`。
+- **融合路径要设「可证明等价」的进入条件，并保留旧路径兜底**：k=7 的融合要求
+  W%8==0 + 8B 对齐 + H>=4，其余（含所有奇数宽、极扁图）回退两遍路径；H<4 的回退是刻意的——
+  旧两遍路径在 H=3 的「单次折叠 + clamp」与 REFLECT_101 周期镜像本就不同，不为非基准角落改既有行为。
 - **两遍分离的列遍不能原地读写输出**：行分块后上方 chunk 的输出会被下方 chunk 当输入读，block 间无同步 → 竞态。
 - warp 内 ILP 取数变体（16B load stride 32B）会破坏合并访存，慢 7 倍；smem 原子冲突在随机数据下不是瓶颈。
 

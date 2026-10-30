@@ -506,6 +506,127 @@ void gauss5_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     }
 }
 
+// ---------------- k=7 固定核单遍融合（2026-10-31）----------------
+// 与 k=5 融合版同构，但两处必须不同：
+//   ① 水平 7-tap 用 __dp4a（sm_61 起支持 u8x4 点积）：每像素 2 条 dp4a（7 tap 拆 4+3，
+//      末位权重 0），8 像素共 16 条，比展开成 IMAD 便宜得多；两个操作数都是同一批
+//      uint2 字的错位重排（funnelshift_r），只有 12 条移位。
+//   ② 垂直求和最大 64*16320 = 1,044,480 > 65535，装不进 u16 lane（k=5 的 __vadd2 打包
+//      在这里会溢出），所以本版 8 像素/线程 + u32 lane 做垂直，权重 [2,7,14,18,14,7,2]
+//      直接由 IMAD 立即数乘。
+// 中间量全精确：h ≤ 16320；S ≤ 1,044,480 < 2^21（float 精确表示）→
+// __float2int_rn(S/4096) 与两遍定点路径、OpenCV CV_32F 管线逐位一致。
+// 边界：水平/垂直都按 REFLECT_101（求和不能用 clamp，见 mean k=3 的教训）。
+// 约束：W%8==0 且 8<=W<=4096、8B 对齐、H>=4；其它回退两遍路径。
+//   H<4 特意回退：H=3 时两遍路径的单次折叠+clamp 与 REFLECT_101 周期镜像本就不同（旧行为），
+//   融合路径（严格周期镜像）虽更接近数学定义，但会改变该角落的既有输出，故不动它。
+__device__ __forceinline__ int g7_mirror(int i, int len)
+{
+    if (len <= 1) return 0;
+    const int per = 2 * len - 2;
+    i %= per;
+    if (i < 0) i += per;
+    return (i < len) ? i : (per - i);
+}
+
+template <int TH>
+__global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                   uint8_t* __restrict__ dst, size_t dstep,
+                                   int W, int H)
+{
+    constexpr uint K1 = 2u | (7u << 8) | (14u << 16) | (18u << 24);   // taps x-3..x
+    constexpr uint K2 = 14u | (7u << 8) | (2u << 16);                 // taps x+1..x+4（末位权重 0）
+    const int tid  = threadIdx.x;
+    const int gx   = (blockIdx.x * blockDim.x + tid) * 8;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (gx < W);
+    const int gxl  = act ? gx : (W - 8);     // 非活跃线程给 8B 对齐安全地址，仍参与 shuffle
+
+    uint h[7][8];
+
+    // 一行 8 像素的水平 7-tap 和（≤16320）
+    auto hrow = [&](int ry, uint o[8]) {
+        const uint8_t* rp = src + (size_t)ry * sstep;
+        const uint2 v = *(const uint2*)(rp + gxl);          // v.x = px0..3, v.y = px4..7
+        uint pv = __shfl_up_sync(0xffffffffu, v.y, 1);      // 前线程 px4..7 = 本线程 px-4..-1
+        uint nv = __shfl_down_sync(0xffffffffu, v.x, 1);    // 后线程 px0..3 = 本线程 px8..11
+        if (lane == 0 || gxl == 0)
+            pv = (gxl == 0) ? __byte_perm(v.x, 0, 0x1234)   // 左边界镜像：(—, px3, px2, px1)
+                            : *(const uint*)(rp + gxl - 4);
+        if (lane == 31 || gxl + 8 >= W) {
+            if (gxl + 8 >= W) {
+                const uint8_t* q = rp + (W - 4);            // (—, W-2, W-3, W-4)
+                nv = (uint)q[2] | ((uint)q[1] << 8) | ((uint)q[0] << 16);
+            } else {
+                nv = *(const uint*)(rp + gxl + 8);
+            }
+        }
+        // lw[i] = 像素 x+i 的左 4 tap 窗口（字节序 x+i-3 .. x+i）；rw[4..7] 同理右窗
+        uint lw[8], rw[8];
+        lw[0] = __funnelshift_r(pv, v.x, 8);
+        lw[1] = __funnelshift_r(pv, v.x, 16);
+        lw[2] = __funnelshift_r(pv, v.x, 24);
+        lw[3] = v.x;
+        lw[4] = __funnelshift_r(v.x, v.y, 8);
+        lw[5] = __funnelshift_r(v.x, v.y, 16);
+        lw[6] = __funnelshift_r(v.x, v.y, 24);
+        lw[7] = v.y;
+        rw[0] = lw[4]; rw[1] = lw[5]; rw[2] = lw[6]; rw[3] = lw[7];
+        rw[4] = __funnelshift_r(v.y, nv, 8);
+        rw[5] = __funnelshift_r(v.y, nv, 16);
+        rw[6] = __funnelshift_r(v.y, nv, 24);
+        rw[7] = nv;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = __dp4a(rw[i], K2, __dp4a(lw[i], K1, 0u));
+    };
+
+#pragma unroll
+    for (int i = 0; i < 7; ++i) hrow(g7_mirror(y0 - 3 + i, H), h[i]);
+
+    for (int y = y0; y < y1; ++y) {
+        uint hn[8];
+        hrow(g7_mirror(y + 4, H), hn);          // 下一轮的最下行（本轮窗口 y-3..y+3）
+        if (act) {
+            uint p[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const uint U  = h[0][k] + h[6][k];
+                const uint V  = h[1][k] + h[5][k];
+                const uint Wd = h[2][k] + h[4][k];
+                const uint S  = 7u * (V + 2u * Wd) + 2u * U + 18u * h[3][k];  // ≤1,044,480
+                const int v = __float2int_rn((float)S * (1.f / 4096.f));       // 与两遍路径同语义
+                p[k] = (uint)max(0, min(255, v));
+            }
+            uint2 o;
+            o.x = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+            o.y = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
+            *(uint2*)(dst + (size_t)y * dstep + gxl) = o;
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            h[0][k] = h[1][k]; h[1][k] = h[2][k]; h[2][k] = h[3][k]; h[3][k] = h[4][k];
+            h[4][k] = h[5][k]; h[5][k] = h[6][k]; h[6][k] = hn[k];
+        }
+    }
+}
+
+void gauss7_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                  int width, int height, int TH, cudaStream_t stream)
+{
+    int th = ((width + 7) / 8 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    dim3 g(idiv_up(width, 8 * th), idiv_up(height, TH));
+    switch (TH) {
+    case 8:  gauss7_fuse_kernel<8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 16: gauss7_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 32: gauss7_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    default: gauss7_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    }
+}
+
 } // anonymous namespace
 
 // host: 与 OpenCV getGaussianKernel(ksize, sigma, CV_32F) 完全一致的权重
@@ -603,6 +724,27 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     // k=7 固定核 [2,7,14,18,14,7,2]/64（sigma<=0）走 u16 定点 tmp：带宽 10B/px → 6B/px，
     // 结果与 OpenCV 逐位一致（行和精确 + 列 float MAC 同序，见 kernel 注释）
     if (ksize == 7 && sigma <= 0.f) {
+        // 单遍融合（2026-10-31）：W%8==0 + 8B 对齐时一遍出图（两遍路径 6B/px → 4.1B/px 原地）。
+        const bool inplace7 = ((const void*)d_src == (const void*)d_dst);
+        const bool fuse7 = (width >= 8 && width <= 4096 && (width % 8 == 0) && height >= 4 &&
+                            (srcStep % 8 == 0) && (dstStep % 8 == 0) &&
+                            ((uintptr_t)d_src % 8 == 0) && ((uintptr_t)d_dst % 8 == 0));
+        if (fuse7) {
+            const int TH = (height >= 1600) ? 64 : (height > 800 ? 16 : 8);
+            if (inplace7) {
+                const int tstep = (width + 15) & ~15;
+                uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+                gauss7_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
+                int th = ((width + 15) / 16 + 31) / 32 * 32;
+                if (th > 256) th = 256;
+                if (th < 32)  th = 32;
+                dim3 gc(idiv_up(width, 16 * th), height);
+                g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            } else {
+                gauss7_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+            }
+            return;
+        }
         float hw7[MAX_K];
         make_gauss_kernel(7, sigma, hw7);       // 固定核表，float 权重为精确二进分数
         CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw7, sizeof(float) * 7, 0, cudaMemcpyHostToDevice, stream));
