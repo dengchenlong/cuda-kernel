@@ -121,15 +121,18 @@ G:\cuda-kernel
         门槛，H<4 保持旧输出不变（不为非 benchmark 角落改既有行为）。
       - 结果：k=7 1.27~1.61x → **3.20~3.73x**；r44 全量 120/120 WIN 零 lose，min 1.237，中位 4.509x，
         p10 2.156x，CSV 落 docs/bench/bench_sm61_r44.csv。
-- [ ] 下一步（2026-10-31 r44 后）：弱项只剩两组 f32 分离路径 + 1 个噪声项，按性价比：
-      1) **原地路径改 smem tile 融合，去掉 workspace 拷贝**：block 覆盖 1024px × TH=8 行，tile 含
-         ±3 halo 共 TH+6 行（k=5 是 ±2）、1024×1B + 边界列 ≈ 10KB；先装载 → 一次 __syncthreads →
-         计算写 dst。流量 2.5B/px 且原地天然安全（源数据全部先入 smem），预计 4K 原地
-         k=5 0.54 → ~0.30ms、k=7 0.63 → ~0.48ms。注意 smem 装载按 16 对齐、halo 列用镜像，
-         且 block 内行带之间不能跨 block 重叠 halo（同一 block 覆盖整段列才有意义）。
-      2) **gaussian-f32 k=5 / mean-f32 k=3 单遍 f32 融合**（f32 无定点，窗口和直接用 float；
-         输入输出 4B/px、原地 8B/px，理论收益 ~1.4x，排最后）。
-      3) hist-gray 4K 1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
+- [x] 下一步（2026-10-31 r44 后 → 2026-11-02 r45 完成）：② **gaussian-f32 k=5 / mean-f32 k=3 单遍 f32 融合**
+      （BENCHMARK.md 第十四轮）—— 原估 ~1.4x，实测 2.6~3.6x，因为两遍 f32 路实际是 16B/px 不是 8B/px；
+      顺带修掉 `cudaMemcpyToSymbolAsync` 上传权重的 11us 固定开销。详见文末 r45 记录。
+- [ ] 下一步（2026-11-02 r45 后）：f32 分离路径已全部清掉，剩最弱的只有 hist 噪声项与几个 2.2~2.5x 项：
+      1) **u8 高斯原地路径改 smem tile 融合，去掉 workspace 拷贝**：block 覆盖 TW 列 × TH 行，tile 含
+         ±3 halo 行（k=5 是 ±2）+ 4/6 列，先装载 → 一次 __syncthreads → 计算写 dst。流量从 4.1B/px
+         降到 ~2.2B/px（TH=32/TW=512：行 38/32、列 518/512 → 1.20 放大），预计 4K 原地
+         k=5 0.54 → ~0.42ms、k=7 0.63 → ~0.48ms。注意 smem 装载按 16 对齐、halo 列用镜像，
+         且同一 block 必须覆盖整段列（跨 block 的 halo 没有意义）。
+      2) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），可试 TH=8/32 的启动形状微调，
+         收益 <10%，优先级低。
+      3) hist-gray 4K 1.39~1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
@@ -272,6 +275,32 @@ G:\cuda-kernel
     差值 0.166ms ≈ copy16 0.184ms，即原地多出来的就是那一遍拷贝。
   - 验证：probe_g5d 常量/斜坡/冲激 maxdiff=0；probe_g5f 69 用例（23 形状 × in/out/紧排）全 0；
     smoke 120 [OK]；r43 全量 120/120 WIN 零 lose，min 1.253，中位 4.49x，CSV 落库 docs/bench/bench_sm61_r43.csv。
+- 优化（2026-11-02，r45）：f32 单遍融合（mean k=3 / gaussian k=5）+ 权重上传缓存（BENCHMARK.md 第十四轮）。
+  - 病灶：两遍 f32 分离路径流量 16B/px（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4）。4K gaussian-f32 k=5
+    1.5688ms 折算 84 GB/s，已贴住纯 uint4 拷贝天花板 93 GB/s —— 指令层面没有空间，只能砍流量；
+    mean-f32 k=3 1.9528ms 只有 68 GB/s（列遍是 4B 跨行读）。
+  - 定案 `gauss32_fuse_kernel<K,TH>` + `mean32_fuse3_kernel<TH>`：4 px/线程（float4 取、float4 写），
+    寄存器滚动 K 行「水平部分和」；水平 halo 用 `__shfl_up/down` 从邻线程 float4 分量取（K=5 用 v.z/v.w
+    与 v.x/v.y），只有 warp 边界 lane 0/31 与图像边界才落 global 或走镜像。垂直镜像用与旧路径
+    **完全相同**的 fold-once + clamp（不是周期式！—— 旧 f32 路径就是单次折叠，改成周期式会让
+    f32 高斯的输出不再与旧路径逐位一致）。
+  - 算术次序完全沿用旧路径：行遍 `s=0; for q: s=fmaf(c_w[q], p[i+q], s)`；mean 列遍保持
+    `acc = 0+h0+h1+h2` 后 `acc += 新行 - 旧行`（先减后加，不是重算三项）→ 融合输出与两遍路径**逐位一致**。
+  - 约束：out-of-place、W%4==0、8<=W<=4096、src/dst 基址与 step 16B 对齐；其余回退两遍路径。
+  - 顺带：`cudaMemcpyToSymbolAsync` 上传 20B 权重实测 **11.0us**（probe_cwhdr：noop launch 11.7us、
+    copy 11.0us、copy+launch 22.7us 串行叠加），比 640x480 的内核本体还贵 → 加 `upload_w()`
+    （同 ksize + memcmp 权重相同则跳过上传），三个高斯入口（u8 k=7 定点、u8 通用、f32）统一走它。
+  - 结果：mean-f32 k=3 1.24~1.34x → **3.40~3.64x**；gaussian-f32 k=5 1.26~1.33x → **2.27~3.03x**；
+    4K 两个内核都到 91~93 GB/s（= 拷贝天花板，物理上限）。probe 纯内核口径 mean 2.6~3.0x、gauss 1.8~2.1x。
+  - 验证：probe_f32f **116 条断言**（19 组形状 × {融合 out-of-place, 旧两遍 in-place} + 步长填充 4 组
+    + sigma 切换 6 条）：融合 vs 旧路径 diff **全 0**（含 H=1/2/3、W=12/100/127 回退、pad=8/24 非 16B step）；
+    vs OpenCV CPU gauss k=5 diff=0、mean k=3 diff=1.5e-5；sigma 交替（0/1.2/0.7001）证明权重缓存能失效；
+    smoke 120 [OK] 全绿。
+  - 已知既有角落（非本轮引入）：H <= kernel 半径时旧 f32 路径的 fold-once+clamp 与 REFLECT_101 不等价
+    （8x2/16x2 的 k=5 vs OpenCV 差 4~6，k=15 老路径在 8x3/12x5/20x7/256x3 差 0.26~11.7）；融合路径与
+    旧输出逐位一致（保留既有行为），benchmark 尺寸不受影响。
+  - 巡检 r45：120/120 WIN 零 lose，min 1.394（hist-gray 4K 噪声项），p10 2.578，中位 4.266，max 21.9x；
+    CSV 落库 docs/bench/bench_sm61_r45.csv。新增 scripts/run_probe.bat（探针跑法统一）。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub

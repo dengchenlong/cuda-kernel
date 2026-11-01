@@ -91,12 +91,14 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
 | gaussian k=5 / k=7 / k=15 | **2.4x / 3.2x / 2.3x** | **2.6x / 3.5x / 2.6x** | **3.0x / 3.7x / 2.7x** | **3.3x / 3.6x / 2.8x** |
 | hist gray / binary | **3.8x / 4.8x** | **3.2x / 7.1x** | **2.3x / 5.5x** | **1.5x / 7.1x** |
 | mean-f32 k=31 | **11.2x** | **16.5x** | **16.9x** | **19.2x** |
+| mean-f32 k=3 / gaussian-f32 k=5 | **3.5x / 3.0x** | **3.5x / 2.3x** | **3.4x / 2.6x** | **3.6x / 2.7x** |
 | erode/dilate-f32 k=3~31 | **2.3~12.2x** | **2.6~12.1x** | **2.6~12.5x** | **2.6~11.9x** |
 | gaussian-f32 k=15 | **1.3x** | **1.6x** | **1.6x** | **1.8x** |
 
 完整逐项数字（六轮基线）见 [BENCHMARK.md](BENCHMARK.md)，优化过程记录见 [PROGRESS.md](PROGRESS.md)。
 注：hist 行为第九轮（2026-10-26）、mean 行为第十一轮（2026-10-28 r42）、gaussian 行为第十三轮
-（2026-10-31 r44，k=5 与 k=7 均为单遍融合），其余行仍是第五轮基线。
+（2026-10-31 r44，k=5 与 k=7 均为单遍融合）、mean-f32 k=3 与 gaussian-f32 k=5 行为第十四轮
+（2026-11-02 r45，单遍 f32 融合），其余行仍是第五轮基线。
 
 ## 优化经验（踩坑总结）
 
@@ -124,6 +126,14 @@ gpu_gaussian(dGray.data, dGray.step, dOut.data, dOut.step,
   W%8==0 + 8B 对齐 + H>=4，其余（含所有奇数宽、极扁图）回退两遍路径；H<4 的回退是刻意的——
   旧两遍路径在 H=3 的「单次折叠 + clamp」与 REFLECT_101 周期镜像本就不同，不为非基准角落改既有行为。
 - **两遍分离的列遍不能原地读写输出**：行分块后上方 chunk 的输出会被下方 chunk 当输入读，block 间无同步 → 竞态。
+- **f32 两遍分离的流量是 16B/px，不是 8**：读 4 + 写 tmp 4 + 读 tmp 4 + 写 4。只要带宽一贴顶
+  （如 gaussian-f32 4K 的 84 GB/s vs 拷贝天花板 93），指令层面就没有空间，唯一出路是单遍融合：
+  4 px/线程 float4 取写 + 寄存器滚动 K 行，水平 halo 用 `__shfl_up/down` 从邻线程 float4 分量取
+  （只有 warp 边界/图像边界才落 global 或镜像）。实测 4K 8B/px 直接跑到 91~93 GB/s。
+  注意算术次序要与旧路径**逐字对齐**（`s=0; fmaf` 链、滑窗「先减后加」），否则容差测试要放宽。
+- **`cudaMemcpyToSymbolAsync` 上传权重也是隐形固定开销**：20B 常量拷贝实测 11us，且与内核 launch
+  串行叠加（copy+launch 22.7us），在 640x480 上比内核本体还贵。按 (ksize, 权重 memcmp) 缓存跳过上传，
+  同 ksize 不同 sigma 也能正确失效。
 - warp 内 ILP 取数变体（16B load stride 32B）会破坏合并访存，慢 7 倍；smem 原子冲突在随机数据下不是瓶颈。
 
 ## 目录结构
@@ -134,7 +144,7 @@ cuda-kernel/
 ├── bench/           smoke（正确性）、benchmark（性能，vs OpenCV-CUDA）
 ├── scripts/         构建/运行脚本（路径参数化）
 ├── examples/legacy  早期学习用例（与主库无关，仅供参考）
-├── BENCHMARK.md     六轮基准数据
+├── BENCHMARK.md     基准数据（逐轮记录，最新第十四轮）
 └── PROGRESS.md      开发过程与优化记录
 ```
 

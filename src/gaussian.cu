@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 namespace {
 
@@ -675,6 +676,20 @@ static void make_gauss_kernel(int ksize, double sigma, float* w)
     }
 }
 
+// 权重上传缓存（2026-11-02）：cudaMemcpyToSymbolAsync 20B 实测 11.0us（probe_cwhdr），
+// 而 640x480 的 gaussian-f32 内核本体只有 ~45us —— 这笔固定开销占 20%，比内核还贵的典型。
+// 相同 ksize + 相同权重时直接跳过上传。前提：c_w 只被本文件三个高斯入口写，
+// 库本身是单线程/单流使用（ws_grow 也是全局状态）；跳过时设备常量里已是同一批权重，语义不变。
+static void upload_w(const float* hw, int k, cudaStream_t stream)
+{
+    static int   ck = -1;
+    static float cw[MAX_K];
+    if (ck == k && memcmp(cw, hw, sizeof(float) * (size_t)k) == 0) return;
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * k, 0, cudaMemcpyHostToDevice, stream));
+    memcpy(cw, hw, sizeof(float) * (size_t)k);
+    ck = k;
+}
+
 void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
                   int width, int height, int ksize, float sigma, cudaStream_t stream)
 {
@@ -747,7 +762,7 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
         }
         float hw7[MAX_K];
         make_gauss_kernel(7, sigma, hw7);       // 固定核表，float 权重为精确二进分数
-        CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw7, sizeof(float) * 7, 0, cudaMemcpyHostToDevice, stream));
+        upload_w(hw7, 7, stream);
 
         const size_t tstep = (size_t)width * 2;
         uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
@@ -767,7 +782,7 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
 
     float hw[MAX_K];
     make_gauss_kernel(ksize, sigma, hw);
-    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
+    upload_w(hw, ksize, stream);
 
     // v4 路径（spike 002）：OpenCV 同构 4-patch halo 布局，全尺寸实测最快
     {
@@ -1055,6 +1070,101 @@ __global__ void gauss32_cols4_kernel(const float* __restrict__ src, size_t sstep
     }
 }
 
+// ---------------- f32 单遍融合（2026-11-02，r45）----------------
+// 病灶：两遍 f32 分离路径流量 16B/px（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4）。
+// gaussian-f32 k=5 @4K 1.5688ms = 84 GB/s，已贴住纯 uint4 拷贝天花板（93 GB/s）——
+// 带宽饱和的路径只能砍流量：单遍融合 = 8B/px。
+// 结构：4 px/线程（float4 取、写），寄存器里滚动 K 行「水平部分和」；水平 halo 用 __shfl
+// 从邻线程 float4 分量取，只有 warp 边界 / 图像边界才落 global 或镜像。
+// 算术次序与两遍路径完全同序（fmaf 链 c_w[0..K-1] 从 0.f 起）→ 与旧路径逐位一致
+// （probe_f32f 双参照：in-place 走旧 v4 路径对比 + OpenCV CPU）。
+// 约束：out-of-place（dst==src 时滚动窗口的 halo 行已被邻居 block 覆盖）、W%4==0、
+// 8<=W<=4096、16B 对齐；其余回退 v4 两遍路径（结果一致）。
+__device__ __forceinline__ int g32f_mirror(int r, int H)
+{
+    int rr = r;
+    if (rr < 0)  rr = -rr;
+    if (rr >= H) rr = 2 * H - 2 - rr;
+    return max(0, min(H - 1, rr));
+}
+
+template <int K, int TH>
+__global__ void gauss32_fuse_kernel(const float* __restrict__ src, size_t sstep,
+                                    float* __restrict__ dst, size_t dstep,
+                                    int W, int H)
+{
+    constexpr int HALF = K / 2;
+    const int tid  = threadIdx.x;
+    const int x0   = (blockIdx.x * blockDim.x + tid) * 4;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (x0 < W);
+    const int xa   = act ? x0 : ((W - 4) & ~3);   // 非活跃线程给安全地址，仍参与 shuffle
+    const int rows = (int)(sstep >> 2), orows = (int)(dstep >> 2);
+
+    float h[K][4];
+
+    auto hrow = [&](int ry, float o[4]) {
+        const float* srow = src + (size_t)ry * rows;
+        const float4 v = *(const float4*)(srow + xa);
+        float l1 = __shfl_up_sync(0xffffffffu, v.w, 1);
+        float r1 = __shfl_down_sync(0xffffffffu, v.x, 1);
+        float l2 = 0.f, r2 = 0.f;
+        if (K > 3) {
+            l2 = __shfl_up_sync(0xffffffffu, v.z, 1);
+            r2 = __shfl_down_sync(0xffffffffu, v.y, 1);
+        }
+        if (lane == 0 || xa == 0) {
+            if (xa == 0) { l1 = v.y; l2 = v.z; }             // p(-1)=p(1)、p(-2)=p(2)
+            else         { l1 = srow[xa - 1]; l2 = srow[xa - 2]; }
+        }
+        if (lane == 31 || xa + 4 >= W) {
+            if (xa + 4 >= W) { r1 = v.z; r2 = v.y; }         // p(W)=p(W-2)、p(W+1)=p(W-3)
+            else             { r1 = srow[xa + 4]; r2 = srow[xa + 5]; }
+        }
+        float pb[4 + 2 * HALF];
+        if (HALF == 2) { pb[0] = l2; pb[1] = l1; } else { pb[0] = l1; }
+        pb[HALF + 0] = v.x; pb[HALF + 1] = v.y;
+        pb[HALF + 2] = v.z; pb[HALF + 3] = v.w;
+        pb[HALF + 4] = r1;
+        if (HALF == 2) pb[HALF + 5] = r2;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float s = 0.f;
+#pragma unroll
+            for (int q = 0; q < K; ++q) s = fmaf(c_w[q], pb[i + q], s);
+            o[i] = s;
+        }
+    };
+
+#pragma unroll
+    for (int i = 0; i < K; ++i) hrow(g32f_mirror(y0 - HALF + i, H), h[i]);
+
+    for (int y = y0; y < y1; ++y) {
+        float hn[4];
+        hrow(g32f_mirror(y + HALF + 1, H), hn);
+        if (act) {
+            float vv[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float s = 0.f;
+#pragma unroll
+                for (int q = 0; q < K; ++q) s = fmaf(c_w[q], h[q][j], s);
+                vv[j] = s;
+            }
+            float4 o; o.x = vv[0]; o.y = vv[1]; o.z = vv[2]; o.w = vv[3];
+            *(float4*)(dst + (size_t)y * orows + x0) = o;
+        }
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) h[i][j] = h[i + 1][j];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) h[K - 1][j] = hn[j];
+    }
+}
+
 } // namespace
 
 void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
@@ -1062,7 +1172,27 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
 {
     float hw[MAX_K];
     make_gauss_kernel(ksize, sigma, hw);
-    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_w, hw, sizeof(float) * ksize, 0, cudaMemcpyHostToDevice, stream));
+    upload_w(hw, ksize, stream);
+
+    // k=5 单遍融合（2026-11-02）：两遍 16B/px → 8B/px。
+    const bool inplace32 = ((const void*)d_src == (const void*)d_dst);
+    const bool fuse32 = (ksize == 5 && !inplace32 && width >= 8 && width <= 4096 &&
+                         (width % 4 == 0) && (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                         ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+    if (fuse32) {
+        const int TH = (height >= 1600) ? 64 : (height > 800 ? 32 : (height > 400 ? 16 : 8));
+        int th = ((width + 3) / 4 + 31) / 32 * 32;
+        if (th > 256) th = 256;
+        if (th < 32)  th = 32;
+        dim3 g(idiv_up(width, 4 * th), idiv_up(height, TH));
+        switch (TH) {
+        case 8:  gauss32_fuse_kernel<5, 8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        case 16: gauss32_fuse_kernel<5, 16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        case 32: gauss32_fuse_kernel<5, 32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        default: gauss32_fuse_kernel<5, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        }
+        return;
+    }
 
     // v4 路径（spike 002）
     const size_t fstep = (size_t)width * 4;

@@ -592,3 +592,77 @@ probe_g7f 纯内核（同轮，含 launch）：out-of-place 0.0379 / 0.0737 / 0.
   以及 hist-gray 4K 的计时噪声项。
 - 下一步：① 原地路径改 smem tile 融合，去掉那遍 workspace 拷贝（4K 原地 0.63 → 预计 ~0.48ms）；
   ② gaussian-f32 k=5 / mean-f32 k=3 的单遍 f32 融合；③ hist-gray 4K 属噪声区间，不单独开 spike。
+
+## 第十四轮（f32 单遍融合 + 高斯权重上传缓存，2026-11-02）
+
+本轮变更：`mean-f32 k=3`（`mean32_rows_kernel` + `mean32_cols_blocked_kernel`）与
+`gaussian-f32 k=5`（`gauss32_rows4_kernel` + `gauss32_cols4_kernel`）改为单遍融合内核
+`mean32_fuse3_kernel<TH>` / `gauss32_fuse_kernel<K,TH>`；顺带给两侧高斯入口加权重上传缓存。
+
+### 病灶
+
+两遍 f32 分离路径的流量是 **16B/px**（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4），不是直觉上的 8B/px：
+
+| 项目 | 4K 实测 | 折算带宽 | 纯 uint4 拷贝天花板 |
+|---|---|---|---|
+| gaussian-f32 k=5 | 1.5688 ms | 84 GB/s | 93 GB/s（0.178 ms） |
+| mean-f32 k=3 | 1.9528 ms | 68 GB/s | 93 GB/s |
+
+gaussian-f32 已经贴住拷贝天花板 —— 这条路径**没有指令层面的空间，只能砍流量**。
+
+### 定案
+
+- 结构：**4 px/线程**（float4 取、float4 写），寄存器里滚动 K 行「水平部分和」；水平 halo 用
+  `__shfl_up_sync/__shfl_down_sync` 从邻线程的 float4 分量取（K=5 取 `v.z/v.w` 与 `v.x/v.y`），
+  只有 warp 边界（lane 0/31）与图像边界才落 global 或走镜像。
+- 算术次序**完全沿用旧路径**：行遍 `s = 0.f; for q: s = fmaf(c_w[q], p[i+q], s)`；
+  mean 的列遍保持 `acc = 0 + h0 + h1 + h2` 后 `acc += 新行 - 旧行`（先减后加，不是重算三项），
+  因此融合输出与两遍路径**逐位一致**（无需放宽 smoke 容差）。
+- 进入条件：out-of-place、`W%4==0`、`8<=W<=4096`、src/dst 基址与 step 16B 对齐；其余（含 in-place、
+  奇数宽、非 16B step）回退原两遍路径，结果一致。
+- 顺带修掉的隐形固定开销：`cudaMemcpyToSymbolAsync` 上传 20B 权重实测 **11.0 us**（probe_cwhdr：
+  noop launch 11.7us、copy 11.0us、copy+launch 22.7us，串行叠加），比 640x480 的内核本体还贵。
+  改为 `upload_w()`：同 ksize + 同权重（memcmp）直接跳过上传。
+
+### 结果（benchmark 口径，r44 → r45）
+
+| 项目 | r44 | r45 | 提升 |
+|---|---|---|---|
+| mean-f32 k=3 640x480 | 0.0993 / 1.24x | **0.0379 / 3.46x** | 2.6x |
+| mean-f32 k=3 1280x720 | 0.2437 / 1.29x | **0.0983 / 3.46x** | 2.5x |
+| mean-f32 k=3 1920x1080 | 0.5274 / 1.29x | **0.2028 / 3.40x** | 2.6x |
+| mean-f32 k=3 3840x2160 | 1.9528 / 1.34x | **0.7240 / 3.64x** | 2.7x |
+| gaussian-f32 k=5 640x480 | 0.0829 / 1.27x | **0.0410 / 3.03x** | 2.0x |
+| gaussian-f32 k=5 1280x720 | 0.1905 / 1.30x | **0.1106 / 2.27x** | 1.7x |
+| gaussian-f32 k=5 1920x1080 | 0.3860 / 1.33x | **0.2007 / 2.64x** | 1.9x |
+| gaussian-f32 k=5 3840x2160 | 1.5688 / 1.26x | **0.7363 / 2.70x** | 2.1x |
+
+probe_f32f 纯内核（含 launch，紧循环均值）：mean k=3 0.0308 / 0.0897 / 0.1909 / 0.7125 ms
+（旧路径 0.0933 / 0.2497 / 0.5043 / 1.9229，2.6~3.0x）；gauss k=5 0.0322 / 0.1031 / 0.1904 / 0.7243 ms
+（旧路径 0.0616 / 0.1837 / 0.3586 / 1.5412，1.8~2.1x）。
+
+4K 有效带宽：mean 8B/px → **93 GB/s**、gauss 8.25B/px（含 TH=64 的 halo 行）→ **92 GB/s**，
+两者都等于纯拷贝天花板 —— 这两个算子在 f32 上已到物理上限。
+
+### 验证
+
+- probe_f32f：**116 条断言**（19 组形状 8x1…3840x2160 × {融合 out-of-place, 旧两遍 in-place}，
+  加 4 组步长填充 64/8/24 与 6 条 sigma 切换缓存失效）。
+  - 融合 vs 旧路径：**diff 全 0**（含 H=1/2/3 极扁图、W=12/100/127 的非融合回退、pad=8/24 的非 16B step 回退）。
+  - vs OpenCV CPU：gauss k=5 diff=0；mean k=3 diff=1.5e-5（舍入序不同，容差 1e-2）。
+  - sigma 切换（同 k=5、sigma=0 / 1.2 / 0.7001 交替两轮）：diff 3e-5~4.6e-5，证明 `upload_w` 的权重
+    缓存能正确失效。
+- smoke：120 [OK] 全绿（gauss f32 k=5 max diff = 0）。
+- 已知既有角落（非本轮引入）：`H <= kernel 半径` 时旧路径的「单次折叠 + clamp」与 REFLECT_101
+  周期镜像本就不等价（8x2 / 16x2 的 k=5 vs OpenCV 差 4~6，k=15 老路径在 8x3/12x5/20x7/256x3 差 0.26~11.7）。
+  融合路径在这些形状上与**旧输出逐位一致**（保留既有行为）；benchmark 尺寸不受影响。
+
+### 第十四轮结论
+
+- r45 全量 120 项：**120/120 WIN，零 lose**，min 1.394x（hist-gray 4K，十轮聚合中位 >1.0 的噪声项），
+  p10 2.578x，中位 4.266x，max 21.9x。CSV 落库 `docs/bench/bench_sm61_r45.csv`。
+- 原最弱的两组（mean-f32 k=3 1.24~1.34x、gaussian-f32 k=5 1.26~1.33x，共 8 项）全部离开弱项名单，
+  p10 从 2.156x 升到 2.578x。
+- 剩余弱项：hist-gray 4K（~0.11ms 量级的计时噪声项）、f32 k=3 形态学与 720p 的若干 2.2~2.5x 项。
+- 下一步：① u8 高斯的**原地**路径改 smem tile 融合（去掉 workspace 整图拷回，4K 原地 k=5 0.54 → 预计 ~0.42ms）；
+  ② 小图 f32 融合内核的 TH/TH 启动形状微调（<10% 收益，优先级低）；③ hist 噪声项不单独开 spike。

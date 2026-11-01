@@ -380,12 +380,113 @@ __global__ void mean32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
     }
 }
 
+// ---------------- f32 均值 k=3 单遍融合（2026-11-02，r45）----------------
+// 病灶同 gaussian-f32：两遍分离 16B/px（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4），
+// 4K 1.9528ms = 68 GB/s，纯拷贝天花板 93 GB/s → 砍流量到 8B/px。
+// 结构：4 px/线程（float4），寄存器滚动 3 行水平 3-tap 和；水平 halo 用 __shfl。
+// 算术次序与旧两遍路径逐位同序（行遍 sum=0 起顺序加 3 项；列遍 acc 初值顺序加 3 行，
+// 之后 acc += 新行 - 旧行）→ 与旧输出逐位一致。
+// 约束：out-of-place、W%4==0、8<=W<=4096、16B 对齐；其余回退两遍路径。
+__device__ __forceinline__ int m32_mirror(int r, int H)
+{
+    int rr = r;
+    if (rr < 0)  rr = -rr;
+    if (rr >= H) rr = 2 * H - 2 - rr;
+    return max(0, min(H - 1, rr));
+}
+
+template <int TH>
+__global__ void mean32_fuse3_kernel(const float* __restrict__ src, size_t sstep,
+                                    float* __restrict__ dst, size_t dstep,
+                                    int W, int H, float inv_area)
+{
+    const int tid  = threadIdx.x;
+    const int x0   = (blockIdx.x * blockDim.x + tid) * 4;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (x0 < W);
+    const int xa   = act ? x0 : ((W - 4) & ~3);
+    const int rows = (int)(sstep >> 2), orows = (int)(dstep >> 2);
+
+    auto hrow = [&](int ry, float o[4]) {
+        const float* srow = src + (size_t)ry * rows;
+        const float4 v = *(const float4*)(srow + xa);
+        float l1 = __shfl_up_sync(0xffffffffu, v.w, 1);
+        float r1 = __shfl_down_sync(0xffffffffu, v.x, 1);
+        if (lane == 0 || xa == 0) {
+            l1 = (xa == 0) ? v.y : srow[xa - 1];             // p(-1)=p(1)
+        }
+        if (lane == 31 || xa + 4 >= W) {
+            r1 = (xa + 4 >= W) ? v.z : srow[xa + 4];         // p(W)=p(W-2)
+        }
+        const float pb[6] = { l1, v.x, v.y, v.z, v.w, r1 };
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float s = 0.f;
+#pragma unroll
+            for (int q = 0; q < 3; ++q) s += pb[i + q];
+            o[i] = s;
+        }
+    };
+
+    float h[3][4];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) hrow(m32_mirror(y0 - 1 + i, H), h[i]);
+
+    float acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float s = 0.f;
+        s += h[0][j]; s += h[1][j]; s += h[2][j];
+        acc[j] = s;
+    }
+
+    for (int y = y0; y < y1; ++y) {
+        if (act) {
+            float4 o;
+            o.x = acc[0] * inv_area; o.y = acc[1] * inv_area;
+            o.z = acc[2] * inv_area; o.w = acc[3] * inv_area;
+            *(float4*)(dst + (size_t)y * orows + x0) = o;
+        }
+        if (y + 1 < y1) {
+            float hn[4];
+            hrow(m32_mirror(y + 2, H), hn);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[j] += hn[j] - h[0][j];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { h[0][j] = h[1][j]; h[1][j] = h[2][j]; h[2][j] = hn[j]; }
+        }
+    }
+}
+
 } // anonymous namespace
 
 void gpu_mean_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
                   int width, int height, int kw, int kh, cudaStream_t stream)
 {
     const float inv_area = 1.0f / (float)(kw * kh);
+
+    // k=3 单遍融合（2026-11-02）：两遍 16B/px → 8B/px。
+    const bool inplace32 = ((const void*)d_src == (const void*)d_dst);
+    const bool fuse32 = (kw == 3 && kh == 3 && !inplace32 && width >= 8 && width <= 4096 &&
+                         (width % 4 == 0) && (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                         ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+    if (fuse32) {
+        const int TH = (height >= 1600) ? 64 : (height > 800 ? 32 : (height > 400 ? 16 : 8));
+        int th = ((width + 3) / 4 + 31) / 32 * 32;
+        if (th > 256) th = 256;
+        if (th < 32)  th = 32;
+        dim3 g(idiv_up(width, 4 * th), idiv_up(height, TH));
+        switch (TH) {
+        case 8:  mean32_fuse3_kernel<8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area); break;
+        case 16: mean32_fuse3_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area); break;
+        case 32: mean32_fuse3_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area); break;
+        default: mean32_fuse3_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, inv_area); break;
+        }
+        return;
+    }
+
     const size_t tstep = (size_t)width * 4;
     float* tmp = (float*)ws_grow(tstep * height + 1024);
 
