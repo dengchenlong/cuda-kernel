@@ -300,7 +300,10 @@ G:\cuda-kernel
     （8x2/16x2 的 k=5 vs OpenCV 差 4~6，k=15 老路径在 8x3/12x5/20x7/256x3 差 0.26~11.7）；融合路径与
     旧输出逐位一致（保留既有行为），benchmark 尺寸不受影响。
   - 巡检 r45：120/120 WIN 零 lose，min 1.394（hist-gray 4K 噪声项），p10 2.578，中位 4.266，max 21.9x；
-    CSV 落库 docs/bench/bench_sm61_r45.csv。新增 scripts/run_probe.bat（探针跑法统一）。
+      CSV 落库 docs/bench/bench_sm61_r45.csv。新增 scripts/run_probe.bat（探针跑法统一）。
+    - 顺带修 `scripts/push.sh`：cron（无 tty）下 Git Credential Manager 会去开 /dev/tty 提示凭据 →
+      push 根本没发出去，而旧 push_once 的退出码来自 `| tail -3`（恒 0）→ 打出假 push_ok=1。
+      改为 GIT_TERMINAL_PROMPT=0 + GIT_CONFIG_* 注入 `gh auth git-credential`（先清空 GCM）+ 退出码取自 git。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
