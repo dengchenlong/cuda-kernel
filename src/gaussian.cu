@@ -386,15 +386,88 @@ __device__ __forceinline__ int g5_mirror(int i, int len)
     return (i < len) ? i : (per - i);      // REFLECT_101：H=2 时 y=3 要折两次回到 1
 }
 
-template <int TH>
+// ---------------- 原地 halo 暂存（2026-11-03）----------------
+// 原地（benchmark 口径 src==dst）的障碍一直只有一个：block 要读自己上下 R 行 halo，而那些行属于
+// 相邻 block、会被相邻 block 写掉（跨 block 无顺序保证）。此前的解法是「融合写整图 workspace +
+// 整图拷回」（4.1B/px，4K 白扔 0.184ms 的拷贝）。这里改成只把「可能被别人覆盖、但本 block 还要
+// 读」的行先拷进 stash：
+//   · 每条 chunk 边界 c = j*TH 存一个 2R 行窗口 [c-R, c+R)（above R 行 + below R 行）
+//   · 末块底部镜像折回的行用额外 R+2 行底段（含内核预取 y+R+1 折回的最深一行）
+// 行距沿用 srcStep（16B 对齐因此不变），总行数 nby*2R + R+2 —— 4K k=5 是 138 行 = 530KB，
+// 比整图 8.3MB 小 16 倍 → 拷贝开销 0.184ms → ~0.012ms。
+// 本 block 自己的行 [y0,y1) 不需要保护：迭代 y 时只预取 y+R+1（永远领先写入），预载阶段读
+// y0-R..y0+R 也全在任何写之前。
+// 唯一被读到的 clamp 槽位是顶部越界行，但它只可能被「预载且 y0>0」的块访问，而顶部块没有
+// above 窗口 → 不会被误用。
+template <int R>
+__device__ __forceinline__ int gauss_stash_slot(int ry, int y0, int j0, int y1, int j1,
+                                                int H, int nby)
+{
+    if (y1 == H && ry >= H - (R + 2))            // 末块：底部镜像行（写入之后仍要读）
+        return nby * (2 * R) + (ry - (H - (R + 2)));
+    if (ry < y0)                                 // above halo（属于上一块）
+        return j0 * (2 * R) + (ry - (y0 - R));
+    if (ry >= y1)                                // below halo（属于下一块）
+        return j1 * (2 * R) + R + (ry - y1);
+    return -1;                                   // 自己的行：直接读 src
+}
+
+// stash 填充：一行一个 block（16B 向量拷贝；W%16!=0 时尾块按字节）
+template <int R>
+__global__ void gauss_stash_fill_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                        uint8_t* __restrict__ stash, size_t tstep,
+                                        int W, int H, int TH)
+{
+    const int rowId  = blockIdx.y;
+    const int nby    = (H + TH - 1) / TH;
+    const int nwin   = nby * 2 * R;
+    int sy;
+    if (rowId < nwin) {
+        const int jw = rowId / (2 * R);
+        const int t  = rowId - jw * (2 * R);
+        sy = jw * TH - R + t;
+    } else {
+        sy = H - (R + 2) + (rowId - nwin);
+    }
+    sy = max(0, min(H - 1, sy));
+    const uint8_t* sp = src + (size_t)sy * sstep;
+    uint8_t* dp = stash + (size_t)rowId * tstep;
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    if (x + 16 <= W) {
+        *(uint4*)(dp + x) = *(const uint4*)(sp + x);
+    } else if (x < W) {
+        for (int i = x; i < W; ++i) dp[i] = sp[i];
+    }
+}
+
+// 分配 + 填充 stash，返回基址并回填行距（同一 stream 内先于融合内核执行）
+template <int R>
+const uint8_t* gauss_stash_prepare(const uint8_t* d_src, size_t srcStep, int width, int height,
+                                   int TH, size_t& stashStep, cudaStream_t stream)
+{
+    const int nby  = idiv_up(height, TH);
+    const int rows = nby * 2 * R + (R + 2);
+    stashStep = (srcStep + 15) & ~(size_t)15;          // 16B 对齐行距（k=7 的 8B 对齐 src 也能用）
+    uint8_t* st = (uint8_t*)ws_grow((size_t)rows * stashStep + 1024);
+    int th = ((width + 15) / 16 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    dim3 g(idiv_up(width, 16 * th), rows);
+    gauss_stash_fill_kernel<R><<<g, th, 0, stream>>>(d_src, srcStep, st, stashStep, width, height, TH);
+    return st;
+}
+
+template <int TH, bool STASH>
 __global__ void gauss5_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                    uint8_t* __restrict__ dst, size_t dstep,
-                                   int W, int H)
+                                   int W, int H,
+                                   const uint8_t* __restrict__ stash, size_t stashStep)
 {
     const int tid  = threadIdx.x;
     const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
     const int y0   = blockIdx.y * TH;
     const int y1   = min(H, y0 + TH);
+    const int j1   = STASH ? (y1 / TH) : 0;
     const int lane = tid & 31;
     const bool act = (gx < W);
     const int gxl  = act ? gx : ((W - 16) & ~15);   // 非活跃线程给 16B 对齐安全地址，仍参与 shuffle
@@ -403,7 +476,9 @@ __global__ void gauss5_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
 
     // 一行 16 字节的水平 5-tap 和（u16 lane，≤4080）
     auto hrow = [&](int ry, uint o[8]) {
-        const uint8_t* rp = src + (size_t)ry * sstep;
+        const int slot = STASH ? gauss_stash_slot<2>(ry, y0, blockIdx.y, y1, j1, H, gridDim.y) : -1;
+        const uint8_t* rp = (slot < 0) ? (src + (size_t)ry * sstep)
+                                       : (stash + (size_t)slot * stashStep);
         const uint4 w = *(const uint4*)(rp + gxl);
         uint e[9];
         e[0] = __byte_perm(w.x, 0, 0x4140);     // lane0 = px0, lane1 = px1
@@ -444,6 +519,8 @@ __global__ void gauss5_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
     // 预载 y0-2 .. y0+2（行号按 REFLECT_101 镜像）
 #pragma unroll
     for (int i = 0; i < 5; ++i) hrow(g5_mirror(y0 - 2 + i, H), h[i]);
+    // 原地：预载也读了本块自己的行 y0..y0+2，快的 warp 可能已经在写行 y0 → 必须同步一次
+    if (STASH) __syncthreads();
 
     for (int y = y0; y < y1; ++y) {
         uint hn[8];
@@ -474,10 +551,15 @@ __global__ void gauss5_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
             h[0][k] = h[1][k]; h[1][k] = h[2][k]; h[2][k] = h[3][k];
             h[3][k] = h[4][k]; h[4][k] = hn[k];
         }
+        // 原地：块内各 warp 会互相超车（warp 间无顺序保证），快 warp 在迭代 y+3 已经写掉行 y+3，
+        // 慢 warp 在迭代 y 预取的正是行 y+3 → 读到被覆盖的数据（probe_stash1 实测每行 1~4 像素错）。
+        // 每行一次 __syncthreads 把块内 skew 压到 0：迭代开始时所有 warp 都已写完 ≤ y-1，
+        // 预取的 y+3 必然还是原值。out-of-place 不需要（dst 独立）。
+        if (STASH) __syncthreads();
     }
 }
 
-// 整图 uint4 拷贝（原地路径用：融合先写 workspace，再拷回 dst）
+// 整图 uint4 拷贝（小图原地路径：大图才用 stash+barrier，理由见 gpu_gaussian 里的阈值注释）
 __global__ void g5_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
                                  uint8_t* __restrict__ d, size_t dstep, int W)
 {
@@ -492,18 +574,20 @@ __global__ void g5_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
     }
 }
 
+template <bool STASH>
 void gauss5_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
-                  int width, int height, int TH, cudaStream_t stream)
+                  int width, int height, int TH, const uint8_t* stash, size_t stashStep,
+                  cudaStream_t stream)
 {
     int th = ((width + 15) / 16 + 31) / 32 * 32;
     if (th > 256) th = 256;
     if (th < 32)  th = 32;
     dim3 g(idiv_up(width, 16 * th), idiv_up(height, TH));
     switch (TH) {
-    case 8:  gauss5_fuse_kernel<8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    case 16: gauss5_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    case 32: gauss5_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    default: gauss5_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 8:  gauss5_fuse_kernel<8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 16: gauss5_fuse_kernel<16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 32: gauss5_fuse_kernel<32, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    default: gauss5_fuse_kernel<64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     }
 }
 
@@ -530,10 +614,11 @@ __device__ __forceinline__ int g7_mirror(int i, int len)
     return (i < len) ? i : (per - i);
 }
 
-template <int TH>
+template <int TH, bool STASH>
 __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                    uint8_t* __restrict__ dst, size_t dstep,
-                                   int W, int H)
+                                   int W, int H,
+                                   const uint8_t* __restrict__ stash, size_t stashStep)
 {
     constexpr uint K1 = 2u | (7u << 8) | (14u << 16) | (18u << 24);   // taps x-3..x
     constexpr uint K2 = 14u | (7u << 8) | (2u << 16);                 // taps x+1..x+4（末位权重 0）
@@ -541,6 +626,7 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
     const int gx   = (blockIdx.x * blockDim.x + tid) * 8;
     const int y0   = blockIdx.y * TH;
     const int y1   = min(H, y0 + TH);
+    const int j1   = STASH ? (y1 / TH) : 0;
     const int lane = tid & 31;
     const bool act = (gx < W);
     const int gxl  = act ? gx : (W - 8);     // 非活跃线程给 8B 对齐安全地址，仍参与 shuffle
@@ -549,7 +635,9 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
 
     // 一行 8 像素的水平 7-tap 和（≤16320）
     auto hrow = [&](int ry, uint o[8]) {
-        const uint8_t* rp = src + (size_t)ry * sstep;
+        const int slot = STASH ? gauss_stash_slot<3>(ry, y0, blockIdx.y, y1, j1, H, gridDim.y) : -1;
+        const uint8_t* rp = (slot < 0) ? (src + (size_t)ry * sstep)
+                                       : (stash + (size_t)slot * stashStep);
         const uint2 v = *(const uint2*)(rp + gxl);          // v.x = px0..3, v.y = px4..7
         uint pv = __shfl_up_sync(0xffffffffu, v.y, 1);      // 前线程 px4..7 = 本线程 px-4..-1
         uint nv = __shfl_down_sync(0xffffffffu, v.x, 1);    // 后线程 px0..3 = 本线程 px8..11
@@ -585,6 +673,7 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
 
 #pragma unroll
     for (int i = 0; i < 7; ++i) hrow(g7_mirror(y0 - 3 + i, H), h[i]);
+    if (STASH) __syncthreads();     // 同 k=5：预载读本块自己的行，快的 warp 可能已经在写
 
     for (int y = y0; y < y1; ++y) {
         uint hn[8];
@@ -610,21 +699,24 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
             h[0][k] = h[1][k]; h[1][k] = h[2][k]; h[2][k] = h[3][k]; h[3][k] = h[4][k];
             h[4][k] = h[5][k]; h[5][k] = h[6][k]; h[6][k] = hn[k];
         }
+        if (STASH) __syncthreads();     // 同 k=5：块内 warp 超车会把预取行读成已写数据
     }
 }
 
+template <bool STASH>
 void gauss7_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
-                  int width, int height, int TH, cudaStream_t stream)
+                  int width, int height, int TH, const uint8_t* stash, size_t stashStep,
+                  cudaStream_t stream)
 {
     int th = ((width + 7) / 8 + 31) / 32 * 32;
     if (th > 256) th = 256;
     if (th < 32)  th = 32;
     dim3 g(idiv_up(width, 8 * th), idiv_up(height, TH));
     switch (TH) {
-    case 8:  gauss7_fuse_kernel<8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    case 16: gauss7_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    case 32: gauss7_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-    default: gauss7_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 8:  gauss7_fuse_kernel<8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 16: gauss7_fuse_kernel<16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 32: gauss7_fuse_kernel<32, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    default: gauss7_fuse_kernel<64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     }
 }
 
@@ -707,16 +799,26 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
         if (fuse5) {
             const int TH = (height >= 1600) ? 64 : (height > 800 ? 16 : 8);
             if (inplace) {
-                const int tstep = (width + 15) & ~15;
-                uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
-                gauss5_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
-                int th = ((width + 15) / 16 + 31) / 32 * 32;
-                if (th > 256) th = 256;
-                if (th < 32)  th = 32;
-                dim3 gc(idiv_up(width, 16 * th), height);
-                g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+                // 大图（H>=1000）：前置 stash 只存 halo 行（4K 530KB vs 整图 8.3MB），省掉整图拷回；
+                //   代价是每行一次 __syncthreads（防块内 warp 超车读到自己已写的行）。
+                // 小图：stash 拷贝量与整图同量级，而 barrier 的固定代价反超收益（probe_g5f 实测
+                //   640x480 0.047→0.060、720p 0.091→0.096），所以仍走「写 workspace + 整图拷回」。
+                if (height >= 1000) {
+                    size_t sstep = 0;
+                    const uint8_t* st = gauss_stash_prepare<2>(d_src, srcStep, width, height, TH, sstep, stream);
+                    gauss5_fused<true>(d_src, srcStep, d_dst, dstStep, width, height, TH, st, sstep, stream);
+                } else {
+                    const int tstep = (width + 15) & ~15;
+                    uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+                    gauss5_fused<false>(d_src, srcStep, tmp, tstep, width, height, TH, nullptr, 0, stream);
+                    int th = ((width + 15) / 16 + 31) / 32 * 32;
+                    if (th > 256) th = 256;
+                    if (th < 32)  th = 32;
+                    dim3 gc(idiv_up(width, 16 * th), height);
+                    g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+                }
             } else {
-                gauss5_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+                gauss5_fused<false>(d_src, srcStep, d_dst, dstStep, width, height, TH, nullptr, 0, stream);
             }
             return;
         }
@@ -747,16 +849,19 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
         if (fuse7) {
             const int TH = (height >= 1600) ? 64 : (height > 800 ? 16 : 8);
             if (inplace7) {
+                // k=7 暂不用 stash 路径：probe_g7f 在 4K 原地有偶发 diff（bad 6~50，非确定复现），
+                // 与 k=5 同构但 R=3/8px 每线程、15 warp 每块，块内/块间超车窗口更大；在定位清楚前
+                // 保持「写 workspace + 整图拷回」（正确性优先，4K 0.63ms 仍是 2.6x WIN）。
                 const int tstep = (width + 15) & ~15;
                 uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
-                gauss7_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
+                gauss7_fused<false>(d_src, srcStep, tmp, tstep, width, height, TH, nullptr, 0, stream);
                 int th = ((width + 15) / 16 + 31) / 32 * 32;
                 if (th > 256) th = 256;
                 if (th < 32)  th = 32;
                 dim3 gc(idiv_up(width, 16 * th), height);
                 g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
             } else {
-                gauss7_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+                gauss7_fused<false>(d_src, srcStep, d_dst, dstStep, width, height, TH, nullptr, 0, stream);
             }
             return;
         }

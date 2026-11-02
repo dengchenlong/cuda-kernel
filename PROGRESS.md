@@ -124,15 +124,18 @@ G:\cuda-kernel
 - [x] 下一步（2026-10-31 r44 后 → 2026-11-02 r45 完成）：② **gaussian-f32 k=5 / mean-f32 k=3 单遍 f32 融合**
       （BENCHMARK.md 第十四轮）—— 原估 ~1.4x，实测 2.6~3.6x，因为两遍 f32 路实际是 16B/px 不是 8B/px；
       顺带修掉 `cudaMemcpyToSymbolAsync` 上传权重的 11us 固定开销。详见文末 r45 记录。
-- [ ] 下一步（2026-11-02 r45 后）：f32 分离路径已全部清掉，剩最弱的只有 hist 噪声项与几个 2.2~2.5x 项：
-      1) **u8 高斯原地路径改 smem tile 融合，去掉 workspace 拷贝**：block 覆盖 TW 列 × TH 行，tile 含
-         ±3 halo 行（k=5 是 ±2）+ 4/6 列，先装载 → 一次 __syncthreads → 计算写 dst。流量从 4.1B/px
-         降到 ~2.2B/px（TH=32/TW=512：行 38/32、列 518/512 → 1.20 放大），预计 4K 原地
-         k=5 0.54 → ~0.42ms、k=7 0.63 → ~0.48ms。注意 smem 装载按 16 对齐、halo 列用镜像，
-         且同一 block 必须覆盖整段列（跨 block 的 halo 没有意义）。
-      2) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），可试 TH=8/32 的启动形状微调，
-         收益 <10%，优先级低。
-      3) hist-gray 4K 1.39~1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
+- [x] 下一步（2026-11-02 r45 后 → 2026-11-03 r46 完成）：原地路径去整图拷回 —— 用「只暂存 halo 行」的
+      stash 取代整图 workspace 拷回（原计划的 smem tile 只解决块内，跨 block halo 仍不安全，见 r46 记录）。
+      结果 u8 高斯 k=5 1080p 0.170→0.140、4K 0.544→0.416；k=7 因 4K 偶发 diff 暂留原路径。
+- [ ] 下一步（2026-11-03 r46 后）：
+      1) **把 stash 路径推广到 mean k=3 / morph k=3**（同一套行映射，R=1，chunk 边界 2 行窗口 + 底部 3 行；
+         预期 1080p/4K 各 +15~25%，两族共 12 项）。注意 morph 曾试过「内核内 halo 预存」导致寄存器
+         31→52、4K 慢 2x，那条路不要重走 —— stash 是独立前置内核，不动寄存器。
+      2) **定位 k=7 原地偶发 diff**：probe_g7f 4K 原地 bad 6~50 非确定复现（k=5 同构零错）。R=3 / 8px
+         每线程 / 15 warp 每块的临界条件未查清，怀疑末块底部窗口边界或预取 y+R+1 的折回跨越；修好后
+         k=7 4K 原地预期 0.639 → ~0.50。
+      3) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），TH 启动形状微调，收益 <10%，优先级低。
+      4) hist-gray 4K 1.39~1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
@@ -304,6 +307,29 @@ G:\cuda-kernel
     - 顺带修 `scripts/push.sh`：cron（无 tty）下 Git Credential Manager 会去开 /dev/tty 提示凭据 →
       push 根本没发出去，而旧 push_once 的退出码来自 `| tail -3`（恒 0）→ 打出假 push_ok=1。
       改为 GIT_TERMINAL_PROMPT=0 + GIT_CONFIG_* 注入 `gh auth git-credential`（先清空 GCM）+ 退出码取自 git。
+- 优化（2026-11-03，r46）：u8 高斯**原地路径去整图拷回** —— 只暂存 halo 行（4K 0.544→0.416ms）。
+  - 病灶：原地（benchmark 口径 src==dst）一直是「融合写整图 workspace + 整图 uint4 拷回」= 4.1B/px，
+    4K 白扔 0.184ms。r45 计划里的 smem tile 只解决「块内」，跨 block 的 halo 行照样被邻居写掉，
+    所以改成 **stash**：前置小内核只把「可能被别人覆盖、但本块还要读」的行拷进暂存区 ——
+    每条 chunk 边界一个 2R 行窗口 [c-R, c+R)，末块再加 R+2 行底段（底部镜像折回 + 内核预取 y+R+1）。
+    4K k=5 = 138 行 = 530KB（整图 8.3MB），拷贝开销 0.184ms → ~0.012ms。
+  - **关键坑（probe_stash1 抓到，每行 1~4 像素错、跨全部 block）**：stash 只解决跨 block，
+    块内 **warp 会互相超车**：快 warp 在迭代 y+3 已经写掉行 y+3，慢 warp 在迭代 y 预取的正是行 y+3。
+    修法 = 原地路径每行一次 `__syncthreads()`（skew 压到 0），另在预载后补一次（预载也读本块自己的行）。
+    out-of-place 不加 barrier（STASH 模板参数），性能零影响。
+  - 阈值：barrier 的固定代价在小图上反超收益（640x480 0.047→0.060、720p 0.091→0.096），
+    所以只有 H>=1000（1080p/4K）走 stash，小图仍走「写 workspace + 整图拷回」。
+  - 结果：gauss k=5 1080p 0.170→0.140（3.06→3.48x）、4K 0.544→0.416（2.5→4.47x）；640/720p 不回归。
+  - k=7 **未跟着改**：probe_g7f 在 4K 原地偶发 diff（bad 6~50，非确定复现；同一二进制下 probe_stash2
+    连跑三次又是 0），R=3 / 8px 每线程 / 15 warp 每块的超车窗口更大；定位清楚前保持原路径
+    （0.639ms / 3.89x 仍 WIN），列进「当前下一步」②。
+  - 验证：probe_g5f 69 用例（含 4K/H=1/2/3/回退宽度/in-place/tight）连续两次全过、probe_stash1
+    4K 原地 vs 原地外 bad=0、probe_g7f 95 条全过、smoke 120 [OK]。
+  - 巡检 r46：120/120 WIN 零 lose，min 1.391（hist-gray 4K 噪声项），p10 2.524，中位 4.491，max 21.9；
+    CSV 落库 docs/bench/bench_sm61_r46.csv。
+- 经验追加（2026-11-03）：**「每线程读永远领先写」不足以保证原地安全** —— warp 之间没有顺序保证，
+  块内快 warp 可以把慢 warp 的预取行覆盖掉。原地卷积类内核要么读写完全分离（workspace/快照），
+  要么每行同步一次；用 stash 只压掉跨 block 的那部分，块内这部分必须靠 barrier。
 - 注意：benchmark 里 morphology/mean/gaussian 都是原地调用（src==dst），OpenCV 都是 out-of-place；
   我们的原地路径天然多一次 temp/拷贝，口径偏保守。morph k=3 的 out-of-place 实测 4K 0.208ms（6.8x）。
 - 分支清理状态（2026-10-26 已核实，勿再列为待办）：`spike-arch-scaling` **已删除**——本地 refs 与 GitHub
