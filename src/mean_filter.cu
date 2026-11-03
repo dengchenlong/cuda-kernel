@@ -2,7 +2,9 @@
 // 行遍：u8 -> u16 行和（reflect101 边界在取数时镜像）；列遍：u16 -> u8 归一化
 // 边界语义与 cv::cuda::boxFilter 默认 BORDER_DEFAULT(=REFLECT_101) 一致
 #include "ops.h"
+#include "halo_stash.cuh"
 #include <algorithm>
+#include <cstdlib>
 
 typedef unsigned int uint;   // Windows 下 CUDA 头不保证提供 uint
 
@@ -146,14 +148,16 @@ __device__ __forceinline__ uint m3_div9_pack(uint v)
     return qa | (qb << 8);
 }
 
-template <int TH>
+template <int TH, bool STASH>
 __global__ void mean3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
-                                  uint8_t* __restrict__ dst, size_t dstep, int W, int H)
+                                  uint8_t* __restrict__ dst, size_t dstep, int W, int H,
+                                  const uint8_t* __restrict__ stash, size_t stashStep)
 {
     const int tid  = threadIdx.x;
     const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
     const int y0   = blockIdx.y * TH;
     const int y1   = min(H, y0 + TH);
+    const int j1   = STASH ? (y1 / TH) : 0;
     const int lane = tid & 31;
     const bool act = (gx < W);
     const int gxl  = act ? gx : ((W - 16) & ~15);   // 非活跃线程也给 16B 对齐安全地址参与 shuffle
@@ -161,7 +165,10 @@ __global__ void mean3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
     uint hp[8], hc[8], hn[8];
 
     // 一行 16 字节的水平 3 邻域和（u16 lane，≤765）
-    auto hrow = [&](const uint8_t* rp, uint o[8]) {
+    auto hrow = [&](int ry, uint o[8]) {
+        const int sl = STASH ? halo_stash::slot<1>(ry, y0, blockIdx.y, y1, j1, H, gridDim.y) : -1;
+        const uint8_t* rp = (sl < 0) ? (src + (size_t)ry * sstep)
+                                     : (stash + (size_t)sl * stashStep);
         const uint4 w = *(const uint4*)(rp + gxl);
         uint e[8];
         m3_expand(w.x, e[0], e[1]);
@@ -184,11 +191,13 @@ __global__ void mean3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
     };
 
     // 垂直方向同样要 reflect101：y0==0 时上一行是 row 1（不是 row 0）；末行下一行是 H-2
-    hrow(src + (size_t)((y0 == 0) ? min(1, H - 1) : (y0 - 1)) * sstep, hp);
-    hrow(src + (size_t)y0 * sstep, hc);
+    hrow((y0 == 0) ? min(1, H - 1) : (y0 - 1), hp);
+    hrow(y0, hc);
+    // 原地：预载读的是本块自己的行，快的 warp 可能已经写完行 y0 → 同步一次
+    if (STASH) __syncthreads();
     for (int y = y0; y < y1; ++y) {
         const int yn = (y + 1 < H) ? (y + 1) : max(0, H - 2);
-        hrow(src + (size_t)yn * sstep, hn);
+        hrow(yn, hn);
         if (act) {
             uint4 o;
             uint p[8];
@@ -202,6 +211,9 @@ __global__ void mean3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) { hp[i] = hc[i]; hc[i] = hn[i]; }
+        // 原地：块内 warp 会互相超车（warp 间无顺序保证），快 warp 在迭代 y+1 已经写掉行
+        // y+1，慢 warp 在迭代 y 预取的正是它；每行一次 __syncthreads 把 skew 压到 0。
+        if (STASH) __syncthreads();
     }
 }
 
@@ -220,18 +232,20 @@ __global__ void m3_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
     }
 }
 
+template <bool STASH>
 void mean3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
-                 int width, int height, int TH, cudaStream_t stream)
+                 int width, int height, int TH, const uint8_t* stash, size_t stashStep,
+                 cudaStream_t stream)
 {
     int th = ((width + 15) / 16 + 31) / 32 * 32;
     if (th > 256) th = 256;
     const int gxx = (width + 16 * th - 1) / (16 * th);
     const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : (TH <= 32 ? 32 : 64));
     dim3 g(gxx, (height + th3 - 1) / th3);
-    if (th3 == 8)       mean3_fuse_kernel<8><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
-    else if (th3 == 16) mean3_fuse_kernel<16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
-    else if (th3 == 32) mean3_fuse_kernel<32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
-    else                mean3_fuse_kernel<64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    if (th3 == 8)       mean3_fuse_kernel<8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else if (th3 == 16) mean3_fuse_kernel<16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else if (th3 == 32) mean3_fuse_kernel<32, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else                mean3_fuse_kernel<64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
 }
 
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
@@ -242,6 +256,18 @@ void* ws_grow(size_t need) {
     return b.p;
 }
 inline int idiv_up(int a, int b) { return (a + b - 1) / b; }
+
+// 原地路径选择：大图（H>=1000）走 stash（只暂存 halo 行），小图仍走整图拷回 —— barrier 的
+// 固定代价在小图上反超收益（gaussian r46 probe 实测 640x480 0.047→0.060）。
+// CK_FORCE_STASH=1 强制开启：给 probe 覆盖 TH/nby/尾块 chunk 的角落组合用。
+bool stash_enabled(int height)
+{
+    static const bool forced = [] {
+        const char* s = getenv("CK_FORCE_STASH");
+        return s && s[0] == '1';
+    }();
+    return forced || height >= 1000;
+}
 
 } // anonymous namespace
 
@@ -259,15 +285,26 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
         if (fuse3) {
             const int TH = height <= 1200 ? 16 : 64;
             if (inplace) {
-                const int tstep = (width + 15) & ~15;
-                uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
-                mean3_fused(d_src, srcStep, tmp, tstep, width, height, TH, stream);
-                int th = ((width + 15) / 16 + 31) / 32 * 32;
-                if (th > 256) th = 256;
-                dim3 gc((width + 16 * th - 1) / (16 * th), height);
-                m3_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+                if (stash_enabled(height)) {
+                    // 大图原地：只暂存 halo 行（4K TH=64 → 71 行 = 273KB vs 整图 8.3MB），
+                    // 融合内核读 stash 代替整图拷回
+                    size_t sstep = ((size_t)srcStep + 15) & ~(size_t)15;
+                    const int rows = halo_stash::rows_needed<1>(height, TH);
+                    uint8_t* buf = (uint8_t*)ws_grow((size_t)rows * sstep + 1024);
+                    const uint8_t* st = halo_stash::prepare<1>(d_src, srcStep, width, height, TH,
+                                                               sstep, buf, stream);
+                    mean3_fused<true>(d_src, srcStep, d_dst, dstStep, width, height, TH, st, sstep, stream);
+                } else {
+                    const int tstep = (width + 15) & ~15;
+                    uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+                    mean3_fused<false>(d_src, srcStep, tmp, tstep, width, height, TH, nullptr, 0, stream);
+                    int th = ((width + 15) / 16 + 31) / 32 * 32;
+                    if (th > 256) th = 256;
+                    dim3 gc((width + 16 * th - 1) / (16 * th), height);
+                    m3_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+                }
             } else {
-                mean3_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+                mean3_fused<false>(d_src, srcStep, d_dst, dstStep, width, height, TH, nullptr, 0, stream);
             }
             return;
         }

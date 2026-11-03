@@ -666,3 +666,47 @@ probe_f32f 纯内核（含 launch，紧循环均值）：mean k=3 0.0308 / 0.089
 - 剩余弱项：hist-gray 4K（~0.11ms 量级的计时噪声项）、f32 k=3 形态学与 720p 的若干 2.2~2.5x 项。
 - 下一步：① u8 高斯的**原地**路径改 smem tile 融合（去掉 workspace 整图拷回，4K 原地 k=5 0.54 → 预计 ~0.42ms）；
   ② 小图 f32 融合内核的 TH/TH 启动形状微调（<10% 收益，优先级低）；③ hist 噪声项不单独开 spike。
+
+## 第十五轮（原地 halo stash：gaussian k=5 + mean/morph k=3，2026-11-03 ~ 11-04）
+
+### 病灶
+
+benchmark 里 mean / morph / gaussian 都是**原地**调用（src==dst），而原地路径一直是
+「融合写整图 workspace + 整图 uint4 拷回」= 4.1B/px —— 4K 白扔 0.18ms 的纯拷贝（拷贝天花板 93 GB/s）。
+
+### 解法（stash：只暂存会被覆盖的 halo 行）
+
+`src/halo_stash.cuh`：前置小内核只把「会被相邻 block 覆盖、但本块还要读」的行拷进暂存区 ——
+每条 chunk 边界 `c = j*TH` 一个 2R 行窗口 `[c-R, c+R)`，末块另加 R+2 行底段（覆盖镜像折回
+与内核预取 `y+R+1`）；行距取 16B 对齐的 srcStep。4K k=5(R=2) 138 行 = 530KB、k=3(R=1)
+71 行 = 273KB，vs 整图 8.3MB（小 16~30 倍）。
+
+- **块内 warp 超车必须靠 barrier**：stash 只解决跨 block；块内快 warp 在迭代 `y+R+1` 已经
+  写掉该行，慢 warp 在迭代 `y` 预取的正是它（r46 probe_stash1：每行 1~4 像素错、横跨全部 block）。
+  原地路径每行一次 `__syncthreads()`，预载后补一次；out-of-place 走模板参数 `STASH=false`，零影响。
+- 小图（H<1000）仍走整图拷回：barrier 固定代价在小图上反超收益（gaussian 640x480 0.047→0.060）。
+- `CK_FORCE_STASH=1` 环境变量可强制开启，给 probe 覆盖 TH/nby/尾块组合。
+
+### 结果（r46 高斯 / r47 mean+morph，1050 Ti，原地口径 = benchmark 口径）
+
+| 项 | r45/r46 mine | r47 mine | OpenCV | r47 speedup |
+|---|---|---|---|---|
+| mean k=3 1080p | 0.1239 | **0.0850** | 0.3348 | 2.74 → **3.94x** |
+| mean k=3 4K | 0.4444 | **0.2550** | 1.2780 | 2.81 → **5.01x** |
+| erode k=3 1080p | 0.1034 | **0.0685** | 0.3789 | 3.69 → **5.53x** |
+| erode k=3 4K | 0.3738 | **0.2027** | 1.3844 | 3.71 → **6.83x** |
+| dilate k=3 1080p | 0.1034 | **0.0798** | 0.3973 | 3.72 → **4.98x** |
+| dilate k=3 4K | 0.3727 | **0.2048** | 1.3938 | 3.71 → **6.81x** |
+| gaussian k=5 1080p | 0.1700 | **0.1402** (r46) | 0.4879 | 3.06 → **3.48x** |
+| gaussian k=5 4K | 0.5437 | **0.4157** (r46) | 1.8450 | ~2.5 → **4.52x** |
+
+原地相对原地外的额外成本几乎归零：probe_s3 time 口径 4K ratio = 0.96 / 1.01 / 1.07（mean/erode/dilate）。
+
+### 验证
+
+- probe_s3：**75 用例**（25 形状 × mean/erode/dilate，含 16x1/16x2/16x3 极扁、H=999 与 1000
+  阈值两侧、3840x2160、W%16!=0 的回退对照组），原地输出与同内核 out-of-place **逐位一致**，
+  且连跑两次结果相同（抓非确定性竞态）；`CK_FORCE_STASH=1` 强制口径再跑一遍同样全 0。
+- probe_g5f 69 / probe_stash1 4K 原地 / probe_g7f 95 条（r46）全过；smoke 120 [OK] 全绿。
+- r47 全量 120 项：**120/120 WIN 零 lose**，min 1.094x（hist-gray 1080p 噪声项），p10 2.524x，
+  中位 4.522x，max 21.91x。CSV 落库 `docs/bench/bench_sm61_r47.csv`（r46 见 `bench_sm61_r46.csv`）。

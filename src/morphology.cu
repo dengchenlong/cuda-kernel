@@ -3,7 +3,9 @@
 // 水平/垂直各一遍。边界语义与 OpenCV morphologyDefaultBorderValue 一致：
 //   腐蚀(最小值滤波)边界视为 255（恒等元），膨胀(最大值滤波)边界视为 0 —— 等价于窗口 clamp 到图像内。
 #include "ops.h"
+#include "halo_stash.cuh"
 #include <algorithm>
+#include <cstdlib>
 
 typedef unsigned int uint;   // Windows 下 CUDA 头不保证提供 uint
 
@@ -103,15 +105,16 @@ template <typename Op> struct VOpOf;
 template <> struct VOpOf<MinOp> { using V = VMinU8; };
 template <> struct VOpOf<MaxOp> { using V = VMaxU8; };
 
-template <typename V, int TH>
+template <typename V, int TH, bool STASH>
 __global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                    uint8_t* __restrict__ dst, size_t dstep,
-                                   int W, int H)
+                                   int W, int H, const uint8_t* __restrict__ stash, size_t stashStep)
 {
     const int tid  = threadIdx.x;
     const int gx   = (blockIdx.x * blockDim.x + tid) * 16;
     const int y0   = blockIdx.y * TH;
     const int y1   = min(H, y0 + TH);
+    const int j1   = STASH ? (y1 / TH) : 0;
     const int lane = tid & 31;
     const bool act = (gx < W);
     // 非活跃线程仍要参与 shuffle，给一个 16B 对齐的安全取数地址
@@ -120,12 +123,16 @@ __global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
     const int gxl  = act ? gx : ((W - 16) & ~15);
 
 
-    // 原地（dst==src）不在这里处理：host 端先融合写 workspace 再整图拷贝回 dst，
-    // 这样内核保持最瘦（31 regs / 高占用），比在内核里做 halo + warp 边界预存快一倍
+    // 原地（dst==src）：内核保持最瘦，H>=1000 走前置 stash 只暂存 halo 行（r47），
+    // 小图仍由 host 端「融合写 workspace + 整图拷回」，因为 barrier 固定代价在小图上反超收益。
+    // （历史：在内核里做 halo + warp 边界预存会让寄存器 31→52、4K 慢 2x，不要重走。）
     uint hp[4], hc[4], hn[4];
 
     // 一行内的水平 3 邻域 min/max（4 个 32 位字打包 16 字节）
-    auto hrow = [&](const uint8_t* rp, uint o[4]) {
+    auto hrow = [&](int ry, uint o[4]) {
+        const int sl = STASH ? halo_stash::slot<1>(ry, y0, blockIdx.y, y1, j1, H, gridDim.y) : -1;
+        const uint8_t* rp = (sl < 0) ? (src + (size_t)ry * sstep)
+                                     : (stash + (size_t)sl * stashStep);
         const uint4 w = *(const uint4*)(rp + gxl);
         uint prv = __shfl_up_sync(0xffffffffu, w.w, 1);
         uint nxt = __shfl_down_sync(0xffffffffu, w.x, 1);
@@ -143,10 +150,12 @@ __global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
         }
     };
 
-    hrow(src + (size_t)max(0, y0 - 1) * sstep, hp);
-    hrow(src + (size_t)y0 * sstep, hc);
+    hrow(max(0, y0 - 1), hp);
+    hrow(y0, hc);
+    // 原地：预载读的是本块自己的行，快的 warp 可能已经写完行 y0 → 同步一次
+    if (STASH) __syncthreads();
     for (int y = y0; y < y1; ++y) {
-        hrow(src + (size_t)min(H - 1, y + 1) * sstep, hn);
+        hrow(min(H - 1, y + 1), hn);
         if (act) {
             uint o[4];
 #pragma unroll
@@ -155,6 +164,9 @@ __global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i) { hp[i] = hc[i]; hc[i] = hn[i]; }
+        // 原地：块内 warp 会互相超车（warp 间无顺序保证）—— 快 warp 在迭代 y+1 已经写掉行
+        // y+1，慢 warp 在迭代 y 预取的正是它。每行一次 __syncthreads 把 skew 压到 0。
+        if (STASH) __syncthreads();
     }
 }
 
@@ -173,9 +185,10 @@ __global__ void copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
     }
 }
 
-template <typename Op>
+template <typename Op, bool STASH>
 void morph3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
-                  int width, int height, int TH, cudaStream_t stream)
+                  int width, int height, int TH, const uint8_t* stash, size_t stashStep,
+                  cudaStream_t stream)
 {
     using V = typename VOpOf<Op>::V;
     int th = ((width + 15) / 16 + 31) / 32 * 32;
@@ -183,9 +196,9 @@ void morph3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     const int gxx = (width + 16 * th - 1) / (16 * th);
     const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : 64);
     dim3 g(gxx, (height + th3 - 1) / th3);
-    if (th3 == 8)       morph3_fuse_kernel<V, 8><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
-    else if (th3 == 16) morph3_fuse_kernel<V, 16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
-    else                morph3_fuse_kernel<V, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+    if (th3 == 8)       morph3_fuse_kernel<V, 8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else if (th3 == 16) morph3_fuse_kernel<V, 16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else                morph3_fuse_kernel<V, 64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
 }
 
 template <typename Op>
@@ -361,6 +374,17 @@ uint8_t* ws_grow(size_t need) {
 
 inline int idiv_up(int a, int b) { return (a + b - 1) / b; }
 
+// 原地路径选择：大图（H>=1000）走 stash，小图仍走整图拷回（barrier 固定代价在小图上反超收益）。
+// CK_FORCE_STASH=1 强制开启，给 probe 覆盖 TH/nby/尾块 chunk 的角落组合用。
+bool stash_enabled(int height)
+{
+    static const bool forced = [] {
+        const char* s = getenv("CK_FORCE_STASH");
+        return s && s[0] == '1';
+    }();
+    return forced || height >= 1000;
+}
+
 template <typename Op>
 void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
            int width, int height, int kw, int kh, cudaStream_t stream)
@@ -377,18 +401,26 @@ void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
     if (fuse3) {
         const int TH = height <= 800 ? 8 : (height <= 1200 ? 16 : 64);
         if (inplace) {
-            // 原地：先融合写到 workspace（每行按 16 对齐的紧排），再整图 uint4 拷回 dst。
-            // 内核里做 halo/warp 边界预存能省掉这次拷贝，但实测寄存器从 31 涨到 52、
-            // 4K 反而慢 2x（0.19 → 0.38ms），所以选「拷一遍」。
-            const int tstep = (width + 15) & ~15;
-            uint8_t* tmp = ws_grow((size_t)tstep * height + 1024);
-            morph3_fused<Op>(d_src, srcStep, tmp, tstep, width, height, TH, stream);
-            int th = ((width + 15) / 16 + 31) / 32 * 32;
-            if (th > 256) th = 256;
-            dim3 gc((width + 16 * th - 1) / (16 * th), height);
-            copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            if (stash_enabled(height)) {
+                // 大图原地（r47）：前置 stash 只暂存 halo 行，省掉整图拷回
+                size_t sstep = ((size_t)srcStep + 15) & ~(size_t)15;
+                const int rows = halo_stash::rows_needed<1>(height, TH);
+                uint8_t* buf = ws_grow((size_t)rows * sstep + 1024);
+                const uint8_t* st = halo_stash::prepare<1>(d_src, srcStep, width, height, TH,
+                                                           sstep, buf, stream);
+                morph3_fused<Op, true>(d_src, srcStep, d_dst, dstStep, width, height, TH, st, sstep, stream);
+            } else {
+                // 小图原地：先融合写到 workspace（每行按 16 对齐的紧排），再整图 uint4 拷回 dst。
+                const int tstep = (width + 15) & ~15;
+                uint8_t* tmp = ws_grow((size_t)tstep * height + 1024);
+                morph3_fused<Op, false>(d_src, srcStep, tmp, tstep, width, height, TH, nullptr, 0, stream);
+                int th = ((width + 15) / 16 + 31) / 32 * 32;
+                if (th > 256) th = 256;
+                dim3 gc((width + 16 * th - 1) / (16 * th), height);
+                copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            }
         } else {
-            morph3_fused<Op>(d_src, srcStep, d_dst, dstStep, width, height, TH, stream);
+            morph3_fused<Op, false>(d_src, srcStep, d_dst, dstStep, width, height, TH, nullptr, 0, stream);
         }
         return;
     }

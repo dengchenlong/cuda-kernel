@@ -387,6 +387,8 @@ __device__ __forceinline__ int g5_mirror(int i, int len)
 }
 
 // ---------------- 原地 halo 暂存（2026-11-03）----------------
+// 注：同一套槽位映射/填充内核已抽到 src/halo_stash.cuh（r47 起 mean/morph k=3 复用，R 模板化）。
+// 这里保留 r46 已验证的本地副本（probe_g5f/probe_stash1 smoke 全绿），暂不改成 include 以免动已验证字节。
 // 原地（benchmark 口径 src==dst）的障碍一直只有一个：block 要读自己上下 R 行 halo，而那些行属于
 // 相邻 block、会被相邻 block 写掉（跨 block 无顺序保证）。此前的解法是「融合写整图 workspace +
 // 整图拷回」（4.1B/px，4K 白扔 0.184ms 的拷贝）。这里改成只把「可能被别人覆盖、但本 block 还要
