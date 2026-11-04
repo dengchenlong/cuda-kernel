@@ -173,6 +173,9 @@ G:\cuda-kernel
       5) **本机外部负载**：WSL Debian 里有个 `train_act_expert.py` 长跑（GPU 100%、3.8GB/4GB），
          bench 单轮被拖到 >25 分钟（r48 跑到 99/120 被本轮的 90 分钟预算截断）。后续轮次先
          `nvidia-smi` + `wsl ps` 确认空闲再跑 bench，否则数据（尤其 4K）不可信，也别用超时杀进程。
+- 同步状态（2026-11-05 r48 现场核实）：`bash scripts/push.sh` 打印 `SYNC_OK 587113c`；
+  `git ls-remote --heads origin` 只有 main = 587113c，与本地 HEAD 一致；`git status` 干净。
+  本地另有 `spike-clock-lock` / `spike-hist4k` 两个已合入 main 的分支（见下方「分支清理状态」，非待办）。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
