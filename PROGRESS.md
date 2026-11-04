@@ -143,14 +143,36 @@ G:\cuda-kernel
         3840x2160、W%16!=0 回退对照）原地 vs 原地外**逐位一致**且连跑两次相同；`CK_FORCE_STASH=1`
         强制口径再跑一遍同样全 0；smoke 120 [OK]；r47 全量 **120/120 WIN 零 lose**，min 1.094
         （hist-gray 1080p 噪声），p10 2.524，中位 4.522，CSV 落库 docs/bench/bench_sm61_r47.csv。
-- [ ] 下一步（2026-11-04 r47 后）：
-      1) **定位 k=7 原地偶发 diff**：probe_g7f 4K 原地 bad 6~50 非确定复现（k=5 同构零错）。R=3 / 8px
-         每线程 / 15 warp 每块的临界条件未查清，怀疑末块底部窗口边界或预取 y+R+1 的折回跨越；修好后
-         k=7 4K 原地预期 0.639 → ~0.50（可复用 halo_stash<3>）。
-      2) mean/morph 1080p 现在 TH=16 → 68 个 chunk / 139 行 stash；stash 的填充量随 chunk 数线性涨，
+- [x] 下一步（2026-11-04 r47 后 → 2026-11-05 r48 完成）①：**k=7 原地偶发 diff 定位 = 水平 halo 跨 block**
+      （commit 94baa99，`docs/probes/probe_s7.cu`）
+      - **根因（不是末块边界、不是 y+R+1 折回）**：k=7 融合内核是 **8 px/线程**，`th` 上限 256 → 一个
+        block 只覆盖 `8*256 = 2048` 列。W=3840 时 gridDim.x=2，块 1 的 lane0 走
+        `rp[gxl-4]`（= x=2044..2047，属于块 0），而原地口径下块 0 可能已把这 4 个像素写掉 →
+        错像素**永远落在 x=2048/2049 两列**（probe_s7 稳定复现，y 随机、maxdiff 12~13）。
+        k=5 / mean / morph 是 16 px/线程 × 256 = 4096 列，W≤4096 天生单 block，所以从没暴露。
+        r46 的「非确定 bad 6~50」正是这个两列条带在不同 y 上时隐时现。
+      - 修法：`gauss7_fused` 里 `th` 上限按模板参数分档 —— `STASH ? 512 : 256`
+        （STASH 时保证 `8*th ≥ W`，即整行一个 block；out-of-place 保持 256 线程多 block，
+        parallelism 更好不要跟着放大）。**教训：原地卷积内核的前提不只是「读领先写 + 每行 barrier」，
+        还要求「一行的水平 halo 不跨 block」**，否则块间无顺序保证这条会从列方向漏进来。
+      - **修好后 stash 仍然不划算**：7-tap/8px 的块要 512 线程才保得住单 block，块数腰斩、并行度掉，
+        probe_s7 sweep（交错 A/B、min 口径，3 轮）：1080p stash 0.1987 vs copy 0.1843（**慢 8%**）、
+        4K 1.1889 vs 1.1940（打平）。barrier + stash 填充把 copy-back 的 ~0.17ms 全吃回去了。
+        → **k=7 默认仍走「写 workspace + 整图拷回」**（`stash7_enabled()` 只认 `CK_FORCE_STASH=1`），
+        r48 不改默认路径、不产生性能变化。这条「预期 0.639→0.50」的假设被实测否掉。
+      - 验证：probe_s7 `check`（12 形状 × {默认阈值, CK_FORCE_STASH=1} × 6 轮重跑）全 0；
+        `chunk` 在 CK_TH7=8/16/32/64 四种 chunk 划分下同样全 0；smoke 120 [OK]；probe_g7f 95 条仍全过。
+- [ ] 下一步（2026-11-05 r48 后）：
+      1) mean/morph 1080p 现在 TH=16 → 68 个 chunk / 139 行 stash；stash 填充量随 chunk 数线性涨，
          可试 TH=32（71 行）把 fill 砍半，预期 +5~8%（probe_s3 time 口径验证，别凭猜）。
+      2) **k=7 原地想真提速，只能换思路**：要么 16 px/线程（8B uint2 → 16B uint4，让 256 线程
+         覆盖 4096 列，天生单 block 且并行度不掉）—— 与 k=5 同构，是最有希望的一条；要么放弃 stash。
+         注意垂直和会超 u16（1,044,480），16 px 版仍必须 u32 lane。
       3) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），TH 启动形状微调，收益 <10%，优先级低。
       4) hist-gray 4K 1.39~1.46x 属 ~0.12ms 内核的计时噪声区间（十轮聚合中位 1.08~3.2x），不单独开 spike。
+      5) **本机外部负载**：WSL Debian 里有个 `train_act_expert.py` 长跑（GPU 100%、3.8GB/4GB），
+         bench 单轮被拖到 >25 分钟（r48 跑到 99/120 被本轮的 90 分钟预算截断）。后续轮次先
+         `nvidia-smi` + `wsl ps` 确认空闲再跑 bench，否则数据（尤其 4K）不可信，也别用超时杀进程。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
