@@ -710,3 +710,43 @@ benchmark 里 mean / morph / gaussian 都是**原地**调用（src==dst），而
 - probe_g5f 69 / probe_stash1 4K 原地 / probe_g7f 95 条（r46）全过；smoke 120 [OK] 全绿。
 - r47 全量 120 项：**120/120 WIN 零 lose**，min 1.094x（hist-gray 1080p 噪声项），p10 2.524x，
   中位 4.522x，max 21.91x。CSV 落库 `docs/bench/bench_sm61_r47.csv`（r46 见 `bench_sm61_r46.csv`）。
+
+## 第十六轮（k=7 原地竞态定位：水平 halo 跨 block，2026-11-05）
+
+### 病灶（r46/r47 遗留的「4K 原地偶发 diff bad 6~50」）
+
+不是之前猜的末块底部窗口、也不是预取 `y+R+1` 的镜像折回。真因在**列方向**：
+
+- k=7 融合内核是 **8 px/线程**，`th` 上限 256 → 一个 block 只覆盖 `8*256 = 2048` 列。
+- W=3840 → `gridDim.x = 2`；块 1 的 `lane 0` 走 `rp[gxl-4]`（x=2044..2047，**属于块 0**）。
+  原地口径下块 0 可能已经把这 4 个像素写掉 → 块 1 读到的是「已平滑」的值。
+- 现象：错像素**永远落在 x=2048/2049 两列**，y 随机，maxdiff 12~13，`bad` 随调度在 0~76 摆动
+  —— 完全对上 r46 记录的「非确定复现」。
+- 为什么只有 k=7：k=5 / mean / morph 都是 **16 px/线程 × 256 = 4096 列**，W≤4096 天生单 block，
+  这条路径从未存在。
+
+### 修法与结论
+
+- `gauss7_fused` 的 `th` 上限改为按模板参数分档：`STASH ? 512 : 256` —— STASH 时 `8*th ≥ W`，
+  保证整行一个 block；out-of-place 保持 256 线程多 block（并行度更好，不该跟着放大）。
+- **修好正确性后 stash 仍不划算**：保「整行单 block」要 512 线程，块数腰斩、并行度掉。
+  probe_s7 `sweep`（交错 A/B、取 min、3 轮，1050 Ti）：
+
+  | 尺寸 | stash 原地 | copy 原地 | stash/copy |
+  |---|---|---|---|
+  | 1920x1080 | 0.1987 | 0.1843 | 1.078（慢 8%） |
+  | 3840x2160 | 1.1889 | 1.1940 | 0.996（打平） |
+
+  barrier（每行一次）+ stash 填充把 copy-back 的 ~0.17ms 全吃回去了。
+  → **k=7 默认仍走「写 workspace + 整图拷回」**，r48 默认路径零变化、零性能回退；
+  stash 路径保留在 `CK_FORCE_STASH=1` 后面，供 probe 做正确性回归。
+
+### 验证
+
+- `docs/probes/probe_s7.cu`：`check` = 12 形状 × {默认阈值, CK_FORCE_STASH=1} × 6 轮重跑，
+  原地 vs 同内核 out-of-place 逐位一致，全 0；`chunk` = CK_TH7 ∈ {8,16,32,64} 四种 chunk 划分
+  同样全 0（覆盖末块余数、nby=1、H=4 极扁）。
+- smoke 120 [OK]；probe_g7f 95 条仍全过（out-of-place 与原地默认口径未变）。
+- r48 全量 bench 未完成：本机 WSL 有一个 `train_act_expert.py` 长跑占满 GPU（100%、3.8GB/4GB），
+  bench 单轮被拖到 >25 分钟，跑到 99/120 时按 90 分钟预算截断（数据不作数，已记入 PROGRESS 待办）。
+  本轮改动不碰任何默认路径，r47 的 120/120 结论仍代表当前代码。
