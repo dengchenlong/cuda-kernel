@@ -194,10 +194,11 @@ void morph3_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     int th = ((width + 15) / 16 + 31) / 32 * 32;
     if (th > 256) th = 256;
     const int gxx = (width + 16 * th - 1) / (16 * th);
-    const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : 64);
+    const int th3 = (TH <= 8) ? 8 : (TH <= 16 ? 16 : (TH <= 32 ? 32 : 64));
     dim3 g(gxx, (height + th3 - 1) / th3);
     if (th3 == 8)       morph3_fuse_kernel<V, 8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
     else if (th3 == 16) morph3_fuse_kernel<V, 16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
+    else if (th3 == 32) morph3_fuse_kernel<V, 32, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
     else                morph3_fuse_kernel<V, 64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep);
 }
 
@@ -385,6 +386,15 @@ bool stash_enabled(int height)
     return forced || height >= 1000;
 }
 
+// TH 覆盖（仅 probe 用：CK_TH3=8/16/32/64 扫 chunk 划分对 stash 填充量与并行度的影响）
+int th3_override(int def)
+{
+    const char* s = getenv("CK_TH3");
+    if (!s) return def;
+    const int v = atoi(s);
+    return (v == 8 || v == 16 || v == 32 || v == 64) ? v : def;
+}
+
 template <typename Op>
 void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
            int width, int height, int kw, int kh, cudaStream_t stream)
@@ -399,7 +409,9 @@ void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
                         (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
                         ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
     if (fuse3) {
-        const int TH = height <= 800 ? 8 : (height <= 1200 ? 16 : 64);
+        // 实测（r49 probe_th3）：morph 现有分档已在各尺寸取到最优（640 TH8、720 TH8、1080 TH16、
+        // 4K TH64），不做改动；th3_override 只给 probe 扫 TH=32/64 用。
+        const int TH = th3_override(height <= 800 ? 8 : (height <= 1200 ? 16 : 64));
         if (inplace) {
             if (stash_enabled(height)) {
                 // 大图原地（r47）：前置 stash 只暂存 halo 行，省掉整图拷回

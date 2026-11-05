@@ -269,6 +269,15 @@ bool stash_enabled(int height)
     return forced || height >= 1000;
 }
 
+// TH 覆盖（仅 probe 用：CK_TH3=8/16/32/64 扫 chunk 划分对 stash 填充量与并行度的影响）
+int th3_override(int def)
+{
+    const char* s = getenv("CK_TH3");
+    if (!s) return def;
+    const int v = atoi(s);
+    return (v == 8 || v == 16 || v == 32 || v == 64) ? v : def;
+}
+
 } // anonymous namespace
 
 void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
@@ -283,7 +292,11 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
                             (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
                             ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
         if (fuse3) {
-            const int TH = height <= 1200 ? 16 : 64;
+            // TH 分档（r49 probe_th3 sweep 实测，交错 A/B min 口径）：
+            //   640x480 TH8 0.0236 vs TH16 0.0297（+26%）、720p TH16 0.0584 vs TH8 0.0604、
+            //   1080p TH32 0.0768 vs TH16 0.0799（+4%）、4K TH32 0.2304 vs TH64 0.2468（+7%）
+            // 规律：chunk 越少 stash 填充越省，但块数太少会掉并行度 —— 按高度取拐点。
+            const int TH = th3_override(height <= 600 ? 8 : (height <= 900 ? 16 : 32));
             if (inplace) {
                 if (stash_enabled(height)) {
                     // 大图原地：只暂存 halo 行（4K TH=64 → 71 行 = 273KB vs 整图 8.3MB），

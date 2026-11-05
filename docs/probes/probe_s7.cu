@@ -253,6 +253,65 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    printf("usage: probe_s7 [check|chunk|time|sweep] [rounds]\n");
+    if (mode == "k7scan") {
+        // r49：k=7 原地 stash 路径的 TH 扫描。stash 行数 = nby*2R + R+2 = nby*6+5，
+        // TH 越小 chunk 越多、填充量线性涨（1080p TH=16 → 413 行 ≈ 38% 全图），
+        // 所以 stash 是否划算强烈依赖 TH —— 必须实测，不能沿用 copy 路径的 TH。
+        // 注意：env 必须在计时循环之外设好（_putenv_s 是系统调用，放进计时段会把 copy 路径测假）。
+        const Case perf[] = {{640, 480}, {1280, 720}, {1920, 1080}, {3840, 2160}};
+        const int ths[] = {8, 16, 32, 64};
+        for (const Case& c : perf) {
+            const int W = c.W, H = c.H;
+            const size_t N = (size_t)W * H;
+            std::vector<uint8_t> img(N);
+            fillPat(img, W, H, 4242u);
+            uint8_t* dA; size_t astep; uint8_t* dB; size_t bstep;
+            CK(cudaMallocPitch(&dA, &astep, (size_t)W, H));
+            CK(cudaMallocPitch(&dB, &bstep, (size_t)W, H));
+            CK(cudaMemcpy2D(dA, astep, img.data(), (size_t)W, (size_t)W, H, cudaMemcpyHostToDevice));
+            const int reps = (N > 4000000) ? 50 : (N > 1000000 ? 120 : 200);
+            printf("%4dx%-4d\n", W, H);
+            double bestStash[4];
+            for (int i = 0; i < 4; ++i) bestStash[i] = 1e9;
+            double bestCopy[4];
+            for (int i = 0; i < 4; ++i) bestCopy[i] = 1e9;
+            double bestOop = 1e9;
+            for (int r = 0; r < 3; ++r) {
+                for (int t = 0; t < 4; ++t) {
+                    char buf[8]; snprintf(buf, sizeof(buf), "%d", ths[t]);
+                    envSet("CK_TH7", buf);
+                    envSet("CK_FORCE_STASH", "1");
+                    envSet("CK_NO_STASH", "");
+                    const double ms = timeitMin([&] { gpu_gaussian(dA, astep, dA, astep, W, H, 7, 0.f); }, 3, reps);
+                    if (ms < bestStash[t]) bestStash[t] = ms;
+                    envSet("CK_FORCE_STASH", "");
+                    envSet("CK_NO_STASH", "1");
+                    const double mc = timeitMin([&] { gpu_gaussian(dA, astep, dA, astep, W, H, 7, 0.f); }, 3, reps);
+                    if (mc < bestCopy[t]) bestCopy[t] = mc;
+                }
+                envSet("CK_TH7", "");
+                envSet("CK_NO_STASH", "");
+                const double mo = timeitMin([&] { gpu_gaussian(dA, astep, dB, bstep, W, H, 7, 0.f); }, 3, reps);
+                if (mo < bestOop) bestOop = mo;
+            }
+            envSet("CK_TH7", ""); envSet("CK_FORCE_STASH", ""); envSet("CK_NO_STASH", "");
+            int bi = 0, bci = 0;
+            for (int i = 1; i < 4; ++i) {
+                if (bestStash[i] < bestStash[bi]) bi = i;
+                if (bestCopy[i] < bestCopy[bci]) bci = i;
+            }
+            printf("   out-of-place %.4f\n", bestOop);
+            for (int t = 0; t < 4; ++t)
+                printf("     TH%-2d stash %.4f%s | copy %.4f%s\n", ths[t], bestStash[t],
+                       t == bi ? "*" : " ", bestCopy[t], t == bci ? "*" : " ");
+            printf("   => best stash TH%d %.4f vs best copy TH%d %.4f  ratio %.3f\n",
+                   ths[bi], bestStash[bi], ths[bci], bestCopy[bci], bestStash[bi] / bestCopy[bci]);
+            fflush(stdout);
+            CK(cudaFree(dA)); CK(cudaFree(dB));
+        }
+        return 0;
+    }
+
+    printf("usage: probe_s7 [check|chunk|time|sweep|k7scan] [rounds]\n");
     return 2;
 }
