@@ -16,6 +16,13 @@ constexpr int CT_THREADS = 128;     // 列扫描 block 线程数 (每线程 4 �
 // 旧版固定 12 block×256（96 warp）在 sm_120（170 SM）上只占一小部分 SM，
 // 4K 0.53ms；新 shape 4K 0.19ms（2.8x），全尺寸超 OpenCV（720p 4.1x/4K 2.2x）。
 // 内核逐指令与旧版 grid-stride 版一致，数值路径零改动（sm_61 同样受益或持平）。
+//
+// r50（probe_int1 分段实测）：这段曾是全库最大的单点损失 —— 4K 1.34ms 只有 31 GB/s，
+// 而 pass2 的同类内核能跑 93 GB/s。根因不是算法而是**写粒度**：每 lane 负责 16 字节、
+// 前缀和逐条 u32 标量存，一条 store 的 32 个 lane 落在 32 个相隔 64B 的地址上
+// （= 32 个不同 sector，每个 sector 只写 4/32 字节）→ 写放大把带宽压到 1/3。
+// 改成「16 个前缀先算进寄存器，再用 4 条 uint4 store 写回」后 4K 0.468ms（89 GB/s，2.9x），
+// 数值路径零改动（同一批 run 值，只是打包方式不同）。要求 dst 侧 16B 对齐，否则回落标量存。
 __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                      uint32_t* __restrict__ dst, size_t dstep,
                                      int W, int H)
@@ -23,8 +30,10 @@ __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sst
     const int lane  = threadIdx.x & 31;
     const int warp  = threadIdx.x >> 5;
     constexpr int SEG_BYTES = 512;      // 32 lanes * 16B
-    const bool vecOK = ((sstep & 15) == 0) &&
+    const bool ldVec = ((sstep & 15) == 0) &&
                        ((reinterpret_cast<uintptr_t>(src) & 15) == 0);
+    const bool stVec = ((dstep & 15) == 0) &&
+                       ((reinterpret_cast<uintptr_t>(dst) & 15) == 0);
 
     const int y = blockIdx.x * 8 + warp;
     if (y >= H) return;
@@ -36,8 +45,9 @@ __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sst
         const int my0 = x0 + lane * 16;          // 本 lane 负责 16 字节
         uint32_t vals[16];
         uint32_t partial = 0;
+        const bool full = (my0 + 16 <= W);
 
-        if (my0 + 16 <= W && vecOK) {
+        if (full && ldVec) {
             // 快路径：对齐 uint4 读
             union { uint4 v; uint8_t b[16]; } u;
             u.v = *reinterpret_cast<const uint4*>(srow + my0);
@@ -65,16 +75,53 @@ __global__ void integral_rows_kernel(const uint8_t* __restrict__ src, size_t sst
         carry += seg_total;
 
         uint32_t run = excl;
+        if (full && stVec) {
+            uint32_t o[16];
 #pragma unroll
-        for (int k = 0; k < 16; ++k) {
-            run += vals[k];
-            const int x = my0 + k;
-            if (x < W) drow[x] = run;
+            for (int k = 0; k < 16; ++k) { run += vals[k]; o[k] = run; }
+            uint4* op = (uint4*)(drow + my0);
+            op[0] = make_uint4(o[0],  o[1],  o[2],  o[3]);
+            op[1] = make_uint4(o[4],  o[5],  o[6],  o[7]);
+            op[2] = make_uint4(o[8],  o[9],  o[10], o[11]);
+            op[3] = make_uint4(o[12], o[13], o[14], o[15]);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                run += vals[k];
+                const int x = my0 + k;
+                if (x < W) drow[x] = run;
+            }
         }
     }
 }
 
-// ---------------- Pass 2a: chunk 内列扫描 + 写 carry 矩阵 ----------------
+// ---------------- Pass 2: 列方向扫描 ----------------
+// r50（probe_int1 实测）：旧的「按 CHUNK_H 分块 + carry 回加」策略在 sm_61 上是净亏损 ——
+// chunk 内的列扫描要读 4N 写 4N，回加 carry 再读 4N 写 4N，共 16N 字节；而列扫描本身
+// 不需要分块就能一次走完（每线程独占自己的列，读依赖只在累加器里）。实测 4K：
+// 分块 0.707+0.536=1.243ms vs 单遍 0.708ms（1col）/0.691ms（4col）→ 单遍省掉一半流量。
+// 单遍的代价是并行度只剩 W 个线程（分块版是 W × nChunks），所以 W 小时仍保留分块路径：
+// 实测 4K(W=3840) 单遍 1col 0.708 完胜分块 1.243；1080p(W=1920) 0.183 vs 0.363；720p 0.087 vs 0.172；
+// 640 虽然 nChunks=1（本来就不分块）但 1col 的 640 线程比旧 4col 的 160 线程快 33%（0.044 vs 0.0655）。
+// 阈值取 W >= 512。
+__global__ void integral_cols_1col_kernel(const uint32_t* __restrict__ in, size_t istep,
+                                          uint32_t* __restrict__ out, size_t ostep,
+                                          int W, int H)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= W) return;
+    const uint32_t* ip = (const uint32_t*)((const uint8_t*)in) + c;
+    uint32_t* op = (uint32_t*)((uint8_t*)out) + c;
+    uint32_t car = 0;
+    for (int r = 0; r < H; ++r) {
+        car += *ip;
+        *op = car;
+        ip = (const uint32_t*)((const uint8_t*)ip + istep);
+        op = (uint32_t*)((const uint8_t*)op + ostep);
+    }
+}
+
+// ---------------- Pass 2 回退: chunk 内列扫描 + 写 carry 矩阵 ----------------
 // 每线程处理 4 列 (uint4)，串行走 chunkH 行
 __global__ void integral_cols_kernel(const uint32_t* __restrict__ in, size_t istep,
                                      uint32_t* __restrict__ out, size_t ostep,
@@ -214,7 +261,19 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
     if (nChunks > 1)
         carry = (uint32_t*)ws_grow((size_t)nChunks * width * sizeof(uint32_t));
 
-    if (vecOK) {
+    if (vecOK && width >= 512) {
+        // r50：单遍列扫描（每线程一列走完 H 行）。W>=512 时 512+ 个线程足以占住 SM、
+        // 又省掉「回加 carry」的 8N 字节流量，实测 4K 1.243→0.708ms。
+        const int colBlocks = idiv_up(width, 256);
+        integral_cols_1col_kernel<<<colBlocks, 256, 0, stream>>>(
+            d_dst, dstStep, d_dst, dstStep, width, height);
+    } else if (width >= 512 && (dstStep & 3) == 0 &&
+                   ((reinterpret_cast<uintptr_t>(d_dst) & 3) == 0)) {
+            // 宽图但非 16B 对齐 / W%4!=0：单遍路径不要求 16B，4B 对齐即可（原先会掉进标量回退）
+        const int colBlocks = idiv_up(width, 256);
+        integral_cols_1col_kernel<<<colBlocks, 256, 0, stream>>>(
+            d_dst, dstStep, d_dst, dstStep, width, height);
+    } else if (vecOK) {
         const int colBlocks = idiv_up(width, CT_THREADS * 4);
         if (nChunks == 1) {
             // 单 chunk：无需 carry 矩阵，但仍必须做列方向扫描（此前此处提前 return 是 bug）
