@@ -204,8 +204,9 @@ G:\cuda-kernel
          微基准必须 ≥3 轮交错 A/B 取 min，单轮 bench 中位数不足以分辨 <1% 差异。
       5) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），TH 启动形状微调，收益 <10%，优先级低。
 - 同步状态（2026-11-07 r50 现场核实）：本轮开头先把 r49 遗留的工作树改动（TH 回退 + `probe_th3.cu`
-  + `bench_sm61_r49.csv`）commit 成 `24a56f0` 并 push（`SYNC_OK 24a56f0`）；integral 重写 commit
-  `bb6f228`。收尾 push 结果以日报的 `SYNC_OK <sha>` 为准（本轮不照抄旧值）。
+  + `bench_sm61_r49.csv`）commit 成 `24a56f0` 并 push；integral 重写 commit `bb6f228`、文档 commit
+  `e04158c`，`bash scripts/push.sh` 打印 **`SYNC_OK e04158c`**，`git ls-remote --heads origin main`
+  = `e04158c`，与本地 HEAD 一致，`git status` 干净（本节为现场核实，非照抄）。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
