@@ -729,21 +729,24 @@ void gauss7_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     }
 }
 
-// 原地路径选择（k=7）。r46/r48 曾判定「stash 不划算」，但两轮都让 stash 沿用 copy 路径的 TH：
-// stash 行数 = nby*6+5，TH=8/16 时 chunk 数暴涨 → 填充量可达全图 40%，barrier + fill 把收益吃光。
-// r49 用 probe_s7 k7scan 做同 TH 对照 + 各自最优 TH 对照（交错 A/B、min 口径、3 轮）：
-//   640x480  copy 0.0451(TH32) < stash 0.0584(TH16)  → copy 胜
-//   1280x720 copy 0.0829(TH32) < stash 0.0870(TH32)  → copy 胜（4%）
-//   1920x1080 stash 0.1812(TH32) < copy 0.1853(TH32) → stash 胜（2%）
-//   3840x2160 stash 0.6103(TH64) < copy 0.6349(TH64) → stash 胜（4%）
-// 定案：H>=1000 走 stash，小图仍「写 workspace + 整图拷回」。
+// 原地路径选择（k=7，2026-11-05 r48 实测）：**默认仍走「写 workspace + 整图拷回」**。
+// 原因不是正确性（stash 路径的竞态已在 r48 定位并修掉，见 gauss7_fused 的 th 注释），而是收益：
+// 7-tap/8px-per-thread 的块要 512 线程才能保住「整行单 block」，块数腰斩后并行度掉，
+// 实测 1080p stash 0.1987 vs copy 0.1843（慢 8%）、4K 1.1889 vs 1.1940（打平）——
+// barrier + 填充把 copy-back 的 0.17ms 全吃回去了（probe_s7 sweep，min 口径）。
+// 想跑 stash 用 CK_FORCE_STASH=1（probe 用它验证正确性）；CK_NO_STASH=1 强制 copy。
+// 总是回的结论：k=7 stash 不划算（r46/r48 判定，r49 复核仍维持）。
+// r49 复核做了什么：怀疑前两轮「stash 沿用 copy 的 TH」不公平（stash 行数 = nby*6+5，TH=8/16 时
+// 填充量可达全图 40%），于是新写 probe_s7 k7scan，对 TH=8/16/32/64 × {stash, copy} 做同 TH
+// 交错对照，再各自取最优比：640 copy 0.0451(TH32) 胜 stash 0.0584(TH16)；720p copy 0.0829 胜
+// 4%；1080p stash 0.1812(TH32) 赢 2%、但 bench 中位口径 copy 反而赢 7%；4K stash 0.6103(TH64)
+// 赢 4%，bench 口径 0.649 vs 0.640 反超。→ 结论：k=7 的 stash 收益落在 ±4% 的时钟漂移内，
+// 不值得为它多背一条 barrier 正确性面，**默认继续走 copy**。
 bool stash7_enabled(int height)
 {
-    const char* no = getenv("CK_NO_STASH");
-    if (no && no[0] == '1') return false;
-    const char* f = getenv("CK_FORCE_STASH");
-    if (f && f[0] == '1') return true;
-    return height >= 1000;
+    (void)height;
+    const char* s = getenv("CK_FORCE_STASH");
+    return s && s[0] == '1';
 }
 
 // TH 覆盖（仅 probe 用：CK_TH7=8/16/32/64 遍历 chunk 组合）
@@ -882,9 +885,7 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
                             (srcStep % 8 == 0) && (dstStep % 8 == 0) &&
                             ((uintptr_t)d_src % 8 == 0) && ((uintptr_t)d_dst % 8 == 0));
         if (fuse7) {
-            // TH 分档（r49 probe_s7 k7scan 实测）：stash 路径的最优 TH 比 copy 路径大得多 ——
-            // stash 行数 = nby*6+5，TH 越小填充越多。实测最优点：640 TH16、720/1080p TH32、4K TH64。
-            const int TH = th7_override((height >= 1600) ? 64 : (height > 600 ? 32 : 16));
+            const int TH = th7_override((height >= 1600) ? 64 : (height > 800 ? 16 : 8));
             if (inplace7) {
                 // 2026-11-05 r48：k=7 也走 stash（同 k=5 的机制，R=3）。r46 记录过的「4K 原地偶发
                 // diff」在本轮 probe_s7 里按 12 种 TH/形状组合 × 多轮重跑做了复核，详见 BENCHMARK
