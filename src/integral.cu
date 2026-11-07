@@ -4,6 +4,7 @@
 #include "ops.h"
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
 
 namespace {
 
@@ -222,6 +223,213 @@ __global__ void integral_carry_add_scalar_kernel(uint32_t* __restrict__ out, siz
     }
 }
 
+// ================= r51: 融合单遍路径（6N 字节） =================
+// 现状（r50 后）：pass1 行前缀写 4N + pass2 读 4N 写 4N = 13N 字节，4K 1.18ms 已贴带宽天花板
+// （89~93 GB/s），所以只能砍流量。理想流量 = 读 src 1N + 写 dst 4N = 5N。
+// 单遍的障碍是「写 dst[y][x] 前必须知道上方所有行在 x 列的累加和」，而块间无顺序保证。
+// 解法：把这个「上方累加和」提前独立算出来（它只依赖 src，不依赖任何块的输出）：
+//   A) chunk_sum：把图像按 TH 行切成 nChunks 段，每段按列求「这 TH 行的行和」（只读 1N，
+//      写一个 nChunks*W*4 的极小数组，4K 是 34*3840*4 = 522KB）。
+//   B) chunk_scan：每线程一列，把 A 的结果原地改成跨 chunk 的 exclusive 前缀 = dst[r0-1][x]。
+//   C) fused：每 block 一个 chunk，256 线程 × 16 列，寄存器里存 16 个列累加器；逐行做块内
+//      行扫描（warp shuffle + 跨 warp smem）得到行内前缀，加进累加器后直接写 dst。
+// 流量 = 1N(A 读) + 1N(C 读) + 4N(C 写) = 6N，理论 2.17x 于 13N。
+// 约束：W%16==0 且 W<=4096（256 线程 × 16 列）且 src/dst 与步长 16B 对齐；其余走旧两遍路径。
+// H<64 也走旧路径（块数太少，融合路径的启动/前缀开销反超）。
+
+__global__ void integral_chunk_sum_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                          uint32_t* __restrict__ csum, int W, int H, int TH)
+{
+    const int ngroups = W >> 4;                 // 每 chunk 的 16 列组数
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = ((H + TH - 1) / TH) * ngroups;
+    if (gid >= total) return;
+    const int chunk = gid / ngroups;
+    const int c0 = (gid - chunk * ngroups) * 16;
+    const int r0 = chunk * TH;
+    const int r1 = min(H, r0 + TH);
+
+    uint32_t acc[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) acc[k] = 0;
+    const uint8_t* p = src + (size_t)r0 * sstep + c0;
+    for (int r = r0; r < r1; ++r) {
+        union { uint4 v; uint8_t b[16]; } u;
+        u.v = *reinterpret_cast<const uint4*>(p);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) acc[k] += u.b[k];
+        p += sstep;
+    }
+    uint32_t* o = csum + (size_t)chunk * W + c0;
+    uint4* op = (uint4*)o;
+    op[0] = make_uint4(acc[0],  acc[1],  acc[2],  acc[3]);
+    op[1] = make_uint4(acc[4],  acc[5],  acc[6],  acc[7]);
+    op[2] = make_uint4(acc[8],  acc[9],  acc[10], acc[11]);
+    op[3] = make_uint4(acc[12], acc[13], acc[14], acc[15]);
+}
+
+// B：跨 chunk 的 exclusive 前缀（每线程一列，原地改写 csum）
+__global__ void integral_chunk_scan_kernel(uint32_t* __restrict__ csum, int W, int nChunks)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= W) return;
+    uint32_t s = 0;
+    for (int k = 0; k < nChunks; ++k) {
+        uint32_t* pp = csum + (size_t)k * W + c;
+        const uint32_t v = *pp;
+        *pp = s;
+        s += v;
+    }
+}
+
+// ---------------- r51 融合单遍路径的调度参数 ----------------
+// 目标：nChunks ≈ 64（6 SM 上每 SM ~10 个 block，足够填坑又不至于让 chunk_sum 的前缀数组变大）。
+// TH 取 32 的倍数；下限 32（行内屏障/dst 行距跳转的固定成本摊薄）；上限 256。
+// CK_TH_INT / CK_NOFUSE 仅供 probe 扫参与 A/B 用，正常路径不受影响；
+// 两者都在首次访问时缓存进 static（getenv 在 0.03ms 级小图上不可忽略）。
+constexpr int FUSED_MIN_H = 96;      // H 太小时块数不够，走旧两遍更稳
+
+inline int env_th_override() {
+    static int v = []() {
+        const char* e = getenv("CK_TH_INT");
+        return (e && *e) ? atoi(e) : 0;
+    }();
+    return v;
+}
+
+inline bool env_nofuse() {
+    static bool b = (getenv("CK_NOFUSE") != nullptr);
+    return b;
+}
+
+inline int fused_th(int H) {
+    const int ov = env_th_override();
+    if (ov >= 8) return ov;
+    int th = (H + 63) / 64;
+    th = ((th + 31) / 32) * 32;
+    if (th < 32) th = 32;
+    if (th > 256) th = 256;
+    return th;
+}
+
+// 块内 256 线程（每线程 16 列）的 exclusive 前缀扫描：warp 内 shuffle + 跨 warp smem。
+// 所有线程都必须在场（无效列贡献 seg=0），所以**不能**用 `if (c0>=W) return` 提前退出。
+__device__ __forceinline__ uint32_t block_excl_prefix(uint32_t seg, uint32_t* wsum, uint32_t* woff,
+                                                     int tid, int lane, int warp)
+{
+    uint32_t inc = seg;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
+        if (lane >= d) inc += t;
+    }
+    if (lane == 31) wsum[warp] = inc;
+    __syncthreads();
+    if (tid < 8) {
+        uint32_t x = wsum[tid];
+        const uint32_t self = x;
+        // 只有 lane 0..7 活跃，shfl 的 mask 必须写 0xff（写 0xffffffff 是未定义行为）
+#pragma unroll
+        for (int d = 1; d < 8; d <<= 1) {
+            const uint32_t t = __shfl_up_sync(0xffu, x, d);
+            if (tid >= d) x += t;
+        }
+        woff[tid] = x - self;
+    }
+    __syncthreads();
+    return woff[warp] + (inc - seg);
+}
+
+// C：融合内核（每 block 一个 chunk，TH 行 × 全 W）
+__global__ void integral_fused_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                      uint32_t* __restrict__ dst, size_t dstep,
+                                      const uint32_t* __restrict__ pre,   // [nChunks][W] 或 null
+                                      int W, int H, int TH)
+{
+    __shared__ uint32_t wsum[8];
+    __shared__ uint32_t woff[8];
+    const int chunk = blockIdx.x;
+    const int r0 = chunk * TH;
+    if (r0 >= H) return;
+    const int r1 = min(H, r0 + TH);
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int c0 = tid * 16;
+    // W%16==0 且 W<=4096 时最后一组线程可能越界。**不能提前 return**：
+    // 那样该 warp 不会写 wsum[]，块内跨 warp 前缀读到未初始化值（smoke 128x128 抓到 maxdiff=253）。
+    // 改为「保留线程 + valid 掩码」：无效线程贡献 seg=0、跳过 load/store，屏障与 warp 扫描保持齐整。
+    const bool valid = (c0 < W);
+
+    uint32_t acc[16];
+    {
+        // pre[k][x] 是「前 k 个 chunk 的列和」，而我们要的是 2D 前缀 = 列和沿 x 的前缀，
+        // 所以这里再做一次块内 exclusive 扫描（每 block 只做一次，不是每行）。
+        uint32_t pv[16];
+        uint32_t seg = 0;
+        if (pre && valid) {
+            const uint4* pp = (const uint4*)(pre + (size_t)chunk * W + c0);
+            const uint4 a0 = pp[0], a1 = pp[1], a2 = pp[2], a3 = pp[3];
+            pv[0] = a0.x;  pv[1] = a0.y;  pv[2] = a0.z;  pv[3] = a0.w;
+            pv[4] = a1.x;  pv[5] = a1.y;  pv[6] = a1.z;  pv[7] = a1.w;
+            pv[8] = a2.x;  pv[9] = a2.y;  pv[10] = a2.z; pv[11] = a2.w;
+            pv[12] = a3.x; pv[13] = a3.y; pv[14] = a3.z; pv[15] = a3.w;
+            const uint32_t q0 = pv[0] + pv[1] + pv[2] + pv[3];
+            const uint32_t q1 = pv[4] + pv[5] + pv[6] + pv[7];
+            const uint32_t q2 = pv[8] + pv[9] + pv[10] + pv[11];
+            const uint32_t q3 = pv[12] + pv[13] + pv[14] + pv[15];
+            seg = (q0 + q1) + (q2 + q3);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; ++k) pv[k] = 0;
+        }
+        uint32_t run = block_excl_prefix(seg, wsum, woff, tid, lane, warp);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) { run += pv[k]; acc[k] = run; }
+    }
+
+    const uint8_t* p = src + (size_t)r0 * sstep + c0;
+    uint32_t* q = (uint32_t*)((uint8_t*)dst + (size_t)r0 * dstep) + c0;
+    for (int r = r0; r < r1; ++r) {
+        uint32_t o[16];
+        uint32_t seg = 0;
+        if (valid) {
+            const uint4 v = *reinterpret_cast<const uint4*>(p);
+            o[0] = v.x & 0xffu;         o[1] = (v.x >> 8) & 0xffu;
+            o[2] = (v.x >> 16) & 0xffu; o[3] = v.x >> 24;
+            o[4] = v.y & 0xffu;         o[5] = (v.y >> 8) & 0xffu;
+            o[6] = (v.y >> 16) & 0xffu; o[7] = v.y >> 24;
+            o[8] = v.z & 0xffu;         o[9] = (v.z >> 8) & 0xffu;
+            o[10] = (v.z >> 16) & 0xffu; o[11] = v.z >> 24;
+            o[12] = v.w & 0xffu;        o[13] = (v.w >> 8) & 0xffu;
+            o[14] = (v.w >> 16) & 0xffu; o[15] = v.w >> 24;
+            // 本线程 16 字节的段和（4 路并行再合并，压依赖链）
+            const uint32_t s0 = o[0] + o[1] + o[2] + o[3];
+            const uint32_t s1 = o[4] + o[5] + o[6] + o[7];
+            const uint32_t s2 = o[8] + o[9] + o[10] + o[11];
+            const uint32_t s3 = o[12] + o[13] + o[14] + o[15];
+            seg = (s0 + s1) + (s2 + s3);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 16; ++k) o[k] = 0;
+        }
+
+        const uint32_t run0 = block_excl_prefix(seg, wsum, woff, tid, lane, warp);
+        if (valid) {
+            uint32_t run = run0;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) { run += o[k]; acc[k] += run; }
+            uint4* qp = (uint4*)q;
+            qp[0] = make_uint4(acc[0],  acc[1],  acc[2],  acc[3]);
+            qp[1] = make_uint4(acc[4],  acc[5],  acc[6],  acc[7]);
+            qp[2] = make_uint4(acc[8],  acc[9],  acc[10], acc[11]);
+            qp[3] = make_uint4(acc[12], acc[13], acc[14], acc[15]);
+            p += sstep;
+            q = (uint32_t*)((uint8_t*)q + dstep);
+        }
+    }
+}
+
 // 简单的进程级 workspace（benchmark 进程生命周期用，够用）
 struct DeviceBuf { void* p = nullptr; size_t sz = 0; };
 DeviceBuf& ws() { static DeviceBuf b; return b; }
@@ -243,6 +451,31 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
                   int width, int height, cudaStream_t stream)
 {
     if (width <= 0 || height <= 0) return;
+
+    // ---- r51 融合单遍路径（6N 字节）：W%16==0、W<=4096、16B 对齐、H 够高时分派 ----
+    {
+        const bool a16 = ((width & 15) == 0) && ((srcStep & 15) == 0) && ((dstStep & 15) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(d_src) & 15) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(d_dst) & 15) == 0);
+        const bool nofuse = env_nofuse();   // 仅供 probe 做 A/B 对照
+        if (a16 && width <= 4096 && height >= FUSED_MIN_H && !nofuse) {
+            const int TH = fused_th(height);
+            const int nChunks = idiv_up(height, TH);
+            uint32_t* pre = (nChunks > 1)
+                ? (uint32_t*)ws_grow((size_t)nChunks * width * sizeof(uint32_t)) : nullptr;
+            if (nChunks > 1) {
+                const int groups = (width >> 4);
+                const int total = nChunks * groups;
+                const int blk = 256, grd = idiv_up(total, blk);
+                integral_chunk_sum_kernel<<<grd, blk, 0, stream>>>(d_src, srcStep, pre, width, height, TH);
+                const int scanG = idiv_up(width, 256);
+                integral_chunk_scan_kernel<<<scanG, 256, 0, stream>>>(pre, width, nChunks);
+            }
+            integral_fused_kernel<<<nChunks, 256, 0, stream>>>(
+                d_src, srcStep, d_dst, dstStep, pre, width, height, TH);
+            return;
+        }
+    }
 
     // Pass 1：每 block 8 行（每 warp 一行），grid=(H+7)/8（spike 001：sm_120 上 2.8x）
     {
