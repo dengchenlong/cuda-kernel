@@ -228,10 +228,12 @@ G:\cuda-kernel
          分辨 <1% 差异。**bench 前先暖机**（连续跑两轮，取第二轮），否则 integral 会读出 2.53ms 的
          假数字（r51 第一次 bench 就是这样，冷启动 P8/607MHz）。
       5) 小图（640/720p）f32 融合内核只跑到 60~75 GB/s（4K 是 92），TH 启动形状微调，收益 <10%，优先级低。
-- 同步状态（2026-11-07 r50 现场核实）：本轮开头先把 r49 遗留的工作树改动（TH 回退 + `probe_th3.cu`
-  + `bench_sm61_r49.csv`）commit 成 `24a56f0` 并 push；integral 重写 commit `bb6f228`、文档 commit
-  `e04158c`，`bash scripts/push.sh` 打印 **`SYNC_OK e04158c`**，`git ls-remote --heads origin main`
-  = `e04158c`，与本地 HEAD 一致，`git status` 干净（本节为现场核实，非照抄）。
+- 同步状态（2026-11-08 r51 现场核实）：本轮 3 个 commit —— `879a63a`（融合路径）+ `2ca6705`
+  （每行单屏障 + 自适应块大小）+ `ab38105`（BENCHMARK/PROGRESS + CSV + bench_summary.py），
+  `bash scripts/push.sh` 打印 **`SYNC_OK ab38105`**；`git ls-remote --heads origin main`
+  = `ab381050c0ab4ba53c26d75021223e1237dd7a58`，与本地 HEAD 一致；`git status` 干净。
+  本地分支只剩 `main` + 两个已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题）。
+  （以上均为本轮现场核实，非照抄。）
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
