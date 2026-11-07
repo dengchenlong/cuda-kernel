@@ -312,42 +312,25 @@ inline int fused_th(int H) {
     return th;
 }
 
-// 块内 256 线程（每线程 16 列）的 exclusive 前缀扫描：warp 内 shuffle + 跨 warp smem。
-// 所有线程都必须在场（无效列贡献 seg=0），所以**不能**用 `if (c0>=W) return` 提前退出。
-__device__ __forceinline__ uint32_t block_excl_prefix(uint32_t seg, uint32_t* wsum, uint32_t* woff,
-                                                     int tid, int lane, int warp)
-{
-    uint32_t inc = seg;
-#pragma unroll
-    for (int d = 1; d < 32; d <<= 1) {
-        const uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
-        if (lane >= d) inc += t;
-    }
-    if (lane == 31) wsum[warp] = inc;
-    __syncthreads();
-    if (tid < 8) {
-        uint32_t x = wsum[tid];
-        const uint32_t self = x;
-        // 只有 lane 0..7 活跃，shfl 的 mask 必须写 0xff（写 0xffffffff 是未定义行为）
-#pragma unroll
-        for (int d = 1; d < 8; d <<= 1) {
-            const uint32_t t = __shfl_up_sync(0xffu, x, d);
-            if (tid >= d) x += t;
-        }
-        woff[tid] = x - self;
-    }
-    __syncthreads();
-    return woff[warp] + (inc - seg);
-}
+// 块内 exclusive 前缀扫描（v2：每行只 1 次 __syncthreads）。
+// 旧版每行 2 次屏障（warp 扫描后写 smem → 屏障 → 8 lane 再扫 → 屏障）。
+// v2 去掉第二次屏障：跨 warp 偏移改为「每个线程自己把 wsum[0..warp-1] 加起来」
+// （nwarps ≤ 8，全是同地址广播读，比 shfl 链还便宜），并用**双缓冲 wsum[2][8]** 消除
+// 「下一轮写 / 本轮读」的竞争 —— 屏障保证线程间最多 1 轮 skew，双缓冲刚好够。
+struct FusedSmem {
+    uint32_t wsum[2][8];
+    uint32_t wsum_init[8];
+};
 
 // C：融合内核（每 block 一个 chunk，TH 行 × 全 W）
+// 线程数按宽度自适应：th = ceil(W/16) 向上取整到 warp 倍数（W=3840 → 256，1920 → 128，
+// 1280 → 96，640 → 64）。旧版固定 256 线程，1080p 有 136/256 线程空转。
 __global__ void integral_fused_kernel(const uint8_t* __restrict__ src, size_t sstep,
                                       uint32_t* __restrict__ dst, size_t dstep,
                                       const uint32_t* __restrict__ pre,   // [nChunks][W] 或 null
                                       int W, int H, int TH)
 {
-    __shared__ uint32_t wsum[8];
-    __shared__ uint32_t woff[8];
+    __shared__ FusedSmem sm;
     const int chunk = blockIdx.x;
     const int r0 = chunk * TH;
     if (r0 >= H) return;
@@ -356,15 +339,15 @@ __global__ void integral_fused_kernel(const uint8_t* __restrict__ src, size_t ss
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int c0 = tid * 16;
-    // W%16==0 且 W<=4096 时最后一组线程可能越界。**不能提前 return**：
-    // 那样该 warp 不会写 wsum[]，块内跨 warp 前缀读到未初始化值（smoke 128x128 抓到 maxdiff=253）。
-    // 改为「保留线程 + valid 掩码」：无效线程贡献 seg=0、跳过 load/store，屏障与 warp 扫描保持齐整。
+    // W%16==0 但 W 不是 (32*16) 的整数倍时最后一两个线程越界。**不能提前 return**：
+    // 那样该 warp 不会写 wsum[]，跨 warp 前缀读到未初始化值（smoke 128x128 抓到 maxdiff=253）。
+    // 改为「保留线程 + valid 掩码」：无效线程贡献 seg=0、跳过 load/store，屏障与扫描保持齐整。
     const bool valid = (c0 < W);
 
+    // ---- 起始列累加器 = 「前 chunk 个 chunk 的列和」再做一次块内沿 x 的前缀 ----
+    // pre[k][x] 是列和（不是 2D 前缀），而 acc 要的是 2D 前缀 = 列和沿 x 的前缀。
     uint32_t acc[16];
     {
-        // pre[k][x] 是「前 k 个 chunk 的列和」，而我们要的是 2D 前缀 = 列和沿 x 的前缀，
-        // 所以这里再做一次块内 exclusive 扫描（每 block 只做一次，不是每行）。
         uint32_t pv[16];
         uint32_t seg = 0;
         if (pre && valid) {
@@ -383,13 +366,26 @@ __global__ void integral_fused_kernel(const uint8_t* __restrict__ src, size_t ss
 #pragma unroll
             for (int k = 0; k < 16; ++k) pv[k] = 0;
         }
-        uint32_t run = block_excl_prefix(seg, wsum, woff, tid, lane, warp);
+        // 起始扫描用独立的小数组（不用双缓冲，命中一次就够）
+        uint32_t inc = seg;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
+            if (lane >= d) inc += t;
+        }
+        if (lane == 31) sm.wsum_init[warp] = inc;
+        __syncthreads();
+        uint32_t off = 0;
+        for (int w = 0; w < warp; ++w) off += sm.wsum_init[w];
+        uint32_t run = off + (inc - seg);
 #pragma unroll
         for (int k = 0; k < 16; ++k) { run += pv[k]; acc[k] = run; }
+        __syncthreads();     // wsum_init 下一轮（下一行）不会再用，但保持对称开销可忽略
     }
 
     const uint8_t* p = src + (size_t)r0 * sstep + c0;
     uint32_t* q = (uint32_t*)((uint8_t*)dst + (size_t)r0 * dstep) + c0;
+    const unsigned ones = 0x01010101u;
     for (int r = r0; r < r1; ++r) {
         uint32_t o[16];
         uint32_t seg = 0;
@@ -403,18 +399,25 @@ __global__ void integral_fused_kernel(const uint8_t* __restrict__ src, size_t ss
             o[10] = (v.z >> 16) & 0xffu; o[11] = v.z >> 24;
             o[12] = v.w & 0xffu;        o[13] = (v.w >> 8) & 0xffu;
             o[14] = (v.w >> 16) & 0xffu; o[15] = v.w >> 24;
-            // 本线程 16 字节的段和（4 路并行再合并，压依赖链）
-            const uint32_t s0 = o[0] + o[1] + o[2] + o[3];
-            const uint32_t s1 = o[4] + o[5] + o[6] + o[7];
-            const uint32_t s2 = o[8] + o[9] + o[10] + o[11];
-            const uint32_t s3 = o[12] + o[13] + o[14] + o[15];
-            seg = (s0 + s1) + (s2 + s3);
+            // 段和用 4 条 __dp4a（u8x4 点积，sm_61 起支持）替代 15 条加法
+            seg = __dp4a(v.x, ones, __dp4a(v.y, ones, __dp4a(v.z, ones, __dp4a(v.w, ones, 0u))));
         } else {
 #pragma unroll
             for (int k = 0; k < 16; ++k) o[k] = 0;
         }
 
-        const uint32_t run0 = block_excl_prefix(seg, wsum, woff, tid, lane, warp);
+        uint32_t inc = seg;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const uint32_t t = __shfl_up_sync(0xffffffffu, inc, d);
+            if (lane >= d) inc += t;
+        }
+        const int buf = r & 1;
+        if (lane == 31) sm.wsum[buf][warp] = inc;
+        __syncthreads();                        // 每行仅此一次屏障
+        uint32_t off = 0;
+        for (int w = 0; w < warp; ++w) off += sm.wsum[buf][w];
+        const uint32_t run0 = off + (inc - seg);
         if (valid) {
             uint32_t run = run0;
 #pragma unroll
@@ -471,7 +474,11 @@ void gpu_integral(const uint8_t* d_src, size_t srcStep, uint32_t* d_dst, size_t 
                 const int scanG = idiv_up(width, 256);
                 integral_chunk_scan_kernel<<<scanG, 256, 0, stream>>>(pre, width, nChunks);
             }
-            integral_fused_kernel<<<nChunks, 256, 0, stream>>>(
+            // 线程数按宽度自适应（每线程 16 列，向上取整到 warp）：W=640→64、1280→96、
+            // 1920→128→128、3840→256。旧版固定 256 线程，小图上大半个块空转。
+            const int tw = (width + 15) >> 4;
+            const int fth = ((tw + 31) >> 5) << 5;
+            integral_fused_kernel<<<nChunks, fth, 0, stream>>>(
                 d_src, srcStep, d_dst, dstStep, pre, width, height, TH);
             return;
         }
