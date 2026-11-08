@@ -254,12 +254,12 @@ G:\cuda-kernel
       5) 本轮新增探针已归档 docs/probes/：probe_hgray2（hist 分段）、probe_hgray3（原子压制变体）、
          probe_int6/7/8（ROWS/PF/STCS/NOBAR/寄存器）、probe_int9（**搬运地板**）、probe_int10（TH 扫参）。
           `scripts/bench_list.py`：按 speedup 升序打印 CSV（找最低项用，省去每次写 python -c）。
-- 同步状态（2026-11-08 r51 现场核实）：本轮 3 个 commit —— `879a63a`（融合路径）+ `2ca6705`
-  （每行单屏障 + 自适应块大小）+ `ab38105`（BENCHMARK/PROGRESS + CSV + bench_summary.py），
-  `bash scripts/push.sh` 打印 **`SYNC_OK ab38105`**；`git ls-remote --heads origin main`
-  = `ab381050c0ab4ba53c26d75021223e1237dd7a58`，与本地 HEAD 一致；`git status` 干净。
-  本地分支只剩 `main` + 两个已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题）。
-  （以上均为本轮现场核实，非照抄。）
+- 同步状态（2026-11-09 r52 现场核实）：本轮 3 个 commit —— `c79584e`（7 个新探针归档 + bench_list.py）
+  + `e6395a9`（integral TH 规则修正，pre-commit 重编+smoke 通过）+ `ddfb959`（BENCHMARK/PROGRESS +
+  r52 CSV + bench 原始日志），`bash scripts/push.sh` 打印 **`SYNC_OK ddfb959`**；
+  `git ls-remote --heads origin main` = `ddfb95993d61b627c4aced053d898d18e6be9411`，与本地 HEAD 一致；
+  `git status` 干净。本地分支只剩 `main` + 两个已合入 main 的 `spike-hist4k` / `spike-clock-lock`
+  （非遗留问题）。**r51 的 `ab38105`/`9d83fe7` 已不再是最新，勿再引用。**（以上均为本轮现场核实，非照抄。）
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
