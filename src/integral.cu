@@ -305,8 +305,15 @@ inline bool env_nofuse() {
 inline int fused_th(int H) {
     const int ov = env_th_override();
     if (ov >= 8) return ov;
-    int th = (H + 63) / 64;
-    th = ((th + 31) / 32) * 32;
+    // r52 实测修正（probe_int10，5 轮交错 A/B，四个尺寸各自扫 TH=32..256）：
+    //   4K      TH=96 (nC=23) 0.4626ms 89.7 GB/s  ← 最优；TH=64 (nC=34，原默认) 0.5663 仅 73.2
+    //   1080p   TH=32 (nC=34) 0.1290 最优，TH=48 打平（1% 内），TH≥64 递减
+    //   720p    TH=32 (nC=23) 0.0645 最优；640  TH=32 (nC=15) 最优（TH=32 是下限）
+    // 甜点 = 「每 SM ~4 个常驻 block」⇒ nChunks ≈ 24（fth=256 时 60 regs × 256 = 15360，
+    // 65536 regs/SM ⇒ 4 块/SM）。旧规则 ceil(H/64) 在 4K 上给 34 个 chunk（每 SM 5.7 块），
+    // 块多了但每块只有 64 行、屏障占比例反而升高。新规则直接按 nChunks≈24 定 TH。
+    int th = (H + 23) / 24;                 // ceil(H/24)
+    th = ((th + 16) / 32) * 32;             // 取最近的 32 倍数
     if (th < 32) th = 32;
     if (th > 256) th = 256;
     return th;
