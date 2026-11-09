@@ -170,6 +170,148 @@ __global__ void morph3_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
     }
 }
 
+// ---------------- 大核（k>7）线性走查内核（r53 新增） ----------------
+// 旧 VHG 的病灶（probe_mcol asym 实测，4K、k=15）：行遍 12.42ms、列遍 12.37ms、(1,1) 基线 0.98ms，
+// 且 k=31 与 k=15 几乎同速 ⇒ 耗时与窗口长度无关，全是固定结构开销：每个 block 只产出 128 像素，
+// 却要 load 3 段 + 做 42 次 __syncthreads 的 Hillis-Steele 双扫描（4K = 6.5 万 block × 42 屏障）。
+// 现在改成「一线程一条线，在 smem 里顺序走查」的 van Herk 分解：
+//   U[c] = op(块首 .. c)、D[c] = op(c .. 块尾)，块长 = k；输出窗口 [i, i+k-1] = op(D[i], U[i+k-1])。
+// 每线程只维护一个 running 值（正走算 U、反走算 D），O(1)/像素、零屏障链。
+// 边界：载入时 clamp 到图内（min/max 的恒等元与 clamp 等价，与旧路径语义一致）。
+constexpr int ML_TC  = 64;   // 行遍每 block 的输出列数
+constexpr int ML_RB  = 128;  // 行遍每 block 的输出行数（= 线程数，一线程一行）
+constexpr int ML_RB2 = 64;   // 列遍每 block 的输出行数
+constexpr int ML_KMAX = 33;  // 走查内核支持的核上限（k<=33 ⇒ 半径 <=16，smem 装得下）
+
+// 行遍：srow/tile + sU 各 ML_RB 行（STR 奇数行距错 bank）+ sout 输出暂存（保证写回合并）
+template <typename Op>
+__global__ void morph_rows_line_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                       uint8_t* __restrict__ dst, size_t dstep,
+                                       int W, int H, int k, int STR, int TC)
+{
+    extern __shared__ uint8_t ml[];
+    const int R    = k >> 1;
+    const int SCW  = TC + k - 1;               // 载入列跨度
+    const int r0   = blockIdx.y * ML_RB;
+    const int c0   = blockIdx.x * TC;
+    const int tid  = threadIdx.x;
+    const int nt   = blockDim.x;
+    const int nr   = min(ML_RB, H - r0);
+    const int nc   = min(TC, W - c0);
+
+    uint8_t* srow = ml;                        // ML_RB * STR
+    uint8_t* sU   = srow + (size_t)ML_RB * STR;
+    uint8_t* sout = sU + (size_t)ML_RB * STR;  // ML_RB * TC
+
+    for (int p = 0; p < nr; ++p) {
+        const uint8_t* sp = src + (size_t)(r0 + p) * sstep;
+        uint8_t* tp = srow + (size_t)p * STR;
+        for (int c = tid; c < SCW; c += nt) {
+            const int gx = min(max(c0 - R + c, 0), W - 1);
+            tp[c] = sp[gx];
+        }
+    }
+    __syncthreads();
+
+    if (tid < nr) {                            // 一线程一行：正走 U、反走 D
+        const Op op;
+        const uint8_t* tp = srow + (size_t)tid * STR;
+        uint8_t* up = sU + (size_t)tid * STR;
+        uint8_t* out = sout + (size_t)tid * TC;
+        int m = 0;
+        uint8_t u = Op::ident();
+        for (int c = 0; c < SCW; ++c) {
+            const uint8_t v = tp[c];
+            u = (m == 0) ? v : op(u, v);
+            if (++m == k) m = 0;
+            up[c] = u;
+        }
+        uint8_t d = Op::ident();
+        m = (SCW - 1) % k;
+        for (int c = SCW - 1; c >= 0; --c) {
+            const uint8_t v = tp[c];
+            d = (m == k - 1) ? v : op(v, d);
+            if (m == 0) m = k - 1; else --m;
+            if (c < nc) out[c] = op(d, up[c + k - 1]);
+        }
+    }
+    __syncthreads();
+
+    for (int p = 0; p < nr; ++p) {             // 合并写回
+        const uint8_t* o = sout + (size_t)p * TC;
+        uint8_t* dp = dst + (size_t)(r0 + p) * dstep + c0;
+        for (int c = tid; c < nc; c += nt) dp[c] = o[c];
+    }
+}
+
+// 列遍：sv/sU 各 LR 行 × TC 列；线程 t 负责一列，正走填 U、反走算 D 直接写 dst
+// （同一行的 32 个 lane 落在连续 32 字节 → 写天然合并，不需要输出暂存）
+template <typename Op>
+__global__ void morph_cols_line_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                       uint8_t* __restrict__ dst, size_t dstep,
+                                       int W, int H, int k)
+{
+    extern __shared__ uint8_t ml[];
+    const int R   = k >> 1;
+    const int TC  = ML_TC * 2;                 // 每 block 列数（= 线程数，一线程一列）
+    const int LR  = ML_RB2 + 2 * R;            // 载入行数
+    const int x0  = blockIdx.x * TC;
+    const int y0  = blockIdx.y * ML_RB2;
+    const int t   = threadIdx.x;
+    const int x   = x0 + t;
+
+    uint8_t* sv = ml;                          // LR * TC
+    uint8_t* sU = sv + (size_t)LR * TC;        // LR * TC
+
+    const bool act = (x < W);
+    const int  xc  = act ? x : (W - 1);
+    for (int p = 0; p < LR; ++p) {
+        const int gy = min(max(y0 - R + p, 0), H - 1);
+        sv[(size_t)p * TC + t] = src[(size_t)gy * sstep + xc];
+    }
+    __syncthreads();
+    if (!act) return;
+
+    const int nr = min(ML_RB2, H - y0);
+    const Op op;
+    int m = 0;
+    uint8_t u = Op::ident();
+    for (int p = 0; p < LR; ++p) {
+        const uint8_t v = sv[(size_t)p * TC + t];
+        u = (m == 0) ? v : op(u, v);
+        if (++m == k) m = 0;
+        sU[(size_t)p * TC + t] = u;
+    }
+    uint8_t d = Op::ident();
+    m = (LR - 1) % k;
+    uint8_t* dp = dst + (size_t)y0 * dstep + x;
+    for (int p = LR - 1; p >= 0; --p) {
+        const uint8_t v = sv[(size_t)p * TC + t];
+        d = (m == k - 1) ? v : op(v, d);
+        if (m == 0) m = k - 1; else --m;
+        if (p < nr) dp[(size_t)p * dstep] = op(d, sU[(size_t)(p + k - 1) * TC + t]);
+    }
+}
+
+template <typename Op>
+void morph_line_passes(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                       int width, int height, int kw, int kh, uint8_t* tmp, size_t tmpStep,
+                       cudaStream_t stream)
+{
+    const int STR  = (ML_TC + kw - 1) | 1;      // 奇数行距：相邻行错 bank
+    const size_t smH = (size_t)ML_RB * STR * 2 + (size_t)ML_RB * ML_TC;
+    dim3 gh((width + ML_TC - 1) / ML_TC, (height + ML_RB - 1) / ML_RB);
+    morph_rows_line_kernel<Op><<<gh, ML_RB, smH, stream>>>(
+        d_src, srcStep, tmp, tmpStep, width, height, kw, STR, ML_TC);
+
+    const int TC2  = ML_TC * 2;
+    const int LR2  = ML_RB2 + 2 * (kh >> 1);
+    const size_t smV = (size_t)LR2 * TC2 * 2;
+    dim3 gv((width + TC2 - 1) / TC2, (height + ML_RB2 - 1) / ML_RB2);
+    morph_cols_line_kernel<Op><<<gv, TC2, smV, stream>>>(
+        tmp, tmpStep, d_dst, dstStep, width, height, kh);
+}
+
 // 整图 uint4 拷贝（原地路径用：融合先写 workspace，再拷回 dst）
 __global__ void copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
                               uint8_t* __restrict__ d, size_t dstep, int W)
@@ -395,6 +537,15 @@ int th3_override(int def)
     return (v == 8 || v == 16 || v == 32 || v == 64) ? v : def;
 }
 
+// probe 用：CK_MORPH_LEGACY=1 停用 r53 的走查内核，回落到 VHG（A/B 对照）。
+// 每次调用都读 env（不缓存），因为 probe 要在同一进程里交替切换两条路径；
+// getenv 约 0.1us，而本函数处理的图最小也在 40us 量级，开销可忽略。
+inline bool morph_legacy_only()
+{
+    const char* s = getenv("CK_MORPH_LEGACY");
+    return s && s[0] == '1';
+}
+
 template <typename Op>
 void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
            int width, int height, int kw, int kh, cudaStream_t stream)
@@ -452,6 +603,10 @@ void morph(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
         const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
         dim3 g2(idiv_up(width, 256), idiv_up(height, rpt)), t2(256);
         direct_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tmpStep, d_dst, dstStep, width, height, kh, rpt);
+    } else if (!morph_legacy_only() && kw <= ML_KMAX && kh <= ML_KMAX) {
+        // r53：大核走「一线程一条线 + smem 顺序走查」，替掉 42 屏障的 VHG（见 probe_mcol）
+        morph_line_passes<Op>(d_src, srcStep, d_dst, dstStep, width, height, kw, kh,
+                              tmp, tmpStep, stream);
     } else {
         // 水平：每块 128 线程处理一行的一个段
         dim3 g1(idiv_up(width, VHG_B), height), t1(VHG_B);
