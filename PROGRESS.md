@@ -270,12 +270,13 @@ G:\cuda-kernel
       14.25ms / 581 MP/s，而 u8 同核已 4.57ms / 1816 MP/s —— f32 是 float 版 VHG，病灶同源）。
       预计 4K k=15 4.54→~1.5ms、k=31 14.25→~4.8ms。f32 的 smem 是 float，TC 要按 48KB 上限重算
       （128 列 × 4B × 2 张 × 96 行 = 98KB 超限，需 TC=64 或分两次）。
-- 同步状态（2026-11-10 r53 现场核实）：本轮 2 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
-  归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志），`bash scripts/push.sh`
-  打印 **`SYNC_OK b95c8fc`**；`git ls-remote --heads origin main` = `b95c8fcad05bf…`，与本地 HEAD
-  一致；`git status` 干净（工作区只剩 .gitignore 的 build/ 产物）。本地分支仍只有 `main` +
-  两个已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题）。**r52 的 `ca7a9a4`/`ddfb959`
-  已不再是最新，勿再引用。**（以上均为本轮现场核实，非照抄。）
+- 同步状态（2026-11-10 r53 现场核实）：本轮 3 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
+  归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志）+ 本条状态行补丁。
+  每次 `bash scripts/push.sh` 都亲眼看到 `SYNC_OK <sha>`（依次 b95c8fc → 状态行后的 sha），
+  并用 `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致、`git status` 干净
+  （工作区只剩 .gitignore 的 build/ 产物）。本地分支仍只有 `main` + 两个已合入 main 的
+  `spike-hist4k` / `spike-clock-lock`（非遗留问题）。**r52 的 `ca7a9a4`/`ddfb959` 已不再是最新，
+  勿再引用。**（以上均为本轮现场核实，非照抄。）
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
