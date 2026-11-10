@@ -266,10 +266,29 @@ G:\cuda-kernel
          smoke **120 [OK]** 全 identical。
       6) **未做**：morph-f32 的大核还是老路径（4K k=31 14.25ms / 11.7x），同一套路可套过去；
          以及 r52 清单里原定的三项（integral 1080p 80→86.5 GB/s、k=7 16px/线程、f32 小图 TH）都没动。
-- [x] 下一步（2026-11-10 r53 后）：**morph-f32 大核走同一条 smem 走查**（erode-f32 k=31 4K 现
-      14.25ms / 581 MP/s，而 u8 同核已 4.57ms / 1816 MP/s —— f32 是 float 版 VHG，病灶同源）。
-      预计 4K k=15 4.54→~1.5ms、k=31 14.25→~4.8ms。f32 的 smem 是 float，TC 要按 48KB 上限重算
-      （128 列 × 4B × 2 张 × 96 行 = 98KB 超限，需 TC=64 或分两次）。
+- [x] 下一步（2026-11-10 r53 后 → 2026-11-11 r54 完成）：**morph-f32 大核滑窗寄存器重写**
+      （BENCHMARK.md 第二十一轮）。erode-f32 k=31 4K 14.25ms → **5.90ms**（11.7x→28.1x），
+      k=15 4K 4.56→3.06（11.7x→17.4x）；r54 全量 **120/120 WIN 零 lose**，min 1.381、
+      p10 5.276、中位 20.937，CSV 落 docs/bench/bench_sm61_r54.csv。
+      1) **归因（probe_mf32 asym）**：4K (1,1) 2.26 / (31,1) 3.84 / **(1,31) 23.28ms** ⇒
+         f32 的病灶与 u8 侧不同源——不是固定结构开销，是列遍自身的 O(k)：`float ringv[255]`
+         动态下标落 **local memory** + 每像素一列一写（32 sector 放大）。
+      2) **为什么不能照搬 u8 的 smem 整线走查**：两张 float 线表 128 列 × 96 行 ≈ 98KB
+         超 48KB 上限；缩尺寸会把占用率压到 3~5%。改**滑窗寄存器**：窗口 K 值常驻寄存器、
+         滑动=移位+补新值，O(1)/像素、零 local、零屏障。rows 一线程一行（RB=128，协作载入 +
+         smem 输出暂存 SOUTP=TB+1 错 bank），cols 一线程一列、TB=16 行一段（输出攒寄存器、
+         段尾合并写回）。覆盖奇数 k∈[9,33]，其余核回落旧路径。
+      3) 验证：probe_mf32 **check 68 用例**逐位一致（17 形状 × k=15/31 × erode/dilate，含
+         7x400/4096x64 极扁）；`ab` 纯内核 4K k=31 22.96→8.93（2.57x）、720p k=31 3.04x；
+         smoke 120 [OK]（f32 形态学 vs OpenCV 逐位一致）。
+      4) **踩坑**：① probe 的 g_tmp 按 3840 开、check 却有 4096x64 用例 → 越界假 FAIL，
+         暂存宽度按最大用例开；② CK 宏在 void 函数里 `return 1` 编译错，分开 CK/CKV；
+         ③ bench 口径 640 k=15 从 8.8x→30.2x 的跳跃里有一半是小图旧路径本就快、列遍
+         sector 放大在小图上占比更高。
+- [ ] 下一步（r54 后候选，按性价比排序）：① k=7 morph/mean 的 16px/线程探针（r52 遗留，
+      4K 0.658ms / 3.79x，与 u8 k=3 的 5.0x 相比有空间）；② integral 1080p 80→86.5 GB/s
+      （收益 ≤8%，地板附近）；③ f32 小图 TH 微调（收益小）。f32 大核完成后 f32 家族
+      erode/dilate/mean 全部 ≥10x（除 k=3），无确定性 lose 待攻。
 - 同步状态（2026-11-10 r53 现场核实）：本轮 3 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
   归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志）+ 本条状态行补丁。
   每次 `bash scripts/push.sh` 都亲眼看到 `SYNC_OK <sha>`（依次 b95c8fc → 状态行后的 sha），

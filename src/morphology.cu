@@ -708,6 +708,187 @@ __global__ void morph32_cols_kernel(const float* __restrict__ src, size_t sstep,
     }
 }
 
+// ---------------- 大核（k>7）滑窗寄存器内核（r54 新增） ----------------
+// 病灶（probe_mf32 asym，4K）：列遍是主因 —— (1,31) 23.28ms vs (31,1) 3.84ms vs (1,1) 2.26ms：
+// morph32_cols_kernel 的 float ringv[255] 动态下标落 local memory（每像素 O(k) 次 local 读 +
+// 一列一写 32 sector 放大），行遍直加窗口则被 smem 逐元素读放大。
+// u8 侧 r53 的「smem 整线走查」在 f32 上装不下（两张 float 线表 128 列 × 96 行 ≈ 98KB > 48KB），
+// 改用滑窗寄存器：窗口 K 值常驻寄存器，滑动 = 移位 + 补新值，O(1)/像素、零 local、零屏障。
+// rows：一线程一行（RB=128），block 协作载入 [x0-R, x0+TB-1+R] 列段（线性映射、合并读），
+//       输出写 smem 暂存（SOUTP=TB+1 错 bank）后合并写回；
+// cols：一线程一列、TB 行一段，global 读天然合并（warp 同行邻列），输出攒寄存器、段尾合并写回。
+// 边界 clamp + 恒等元，与旧路径语义一致（probe_mf32 check 68 用例新旧逐位一致）。
+template <typename Op, int K, int TB, int RB>
+__global__ void morph32_rows_win_kernel(const float* __restrict__ src, size_t sstep,
+                                        float* __restrict__ dst, size_t dstep,
+                                        int W, int H)
+{
+    constexpr int RAD   = K >> 1;
+    constexpr int SCW   = TB + K - 1;       // 载入列跨度
+    constexpr int SCWP  = SCW | 1;          // 奇数行距错 bank
+    constexpr int SOUTP = TB + 1;           // 输出暂存行距错 bank
+    __shared__ float s_in[RB * SCWP];
+    __shared__ float s_out[RB * SOUTP];
+
+    const int x0  = blockIdx.x * TB;
+    const int y0  = blockIdx.y * RB;
+    const int tid = threadIdx.x;
+    const Op op;
+
+    // 协作载入（线性映射：相邻线程相邻列；越界列/行填恒等元 = clamp 语义）
+    for (int idx = tid; idx < RB * SCW; idx += RB) {
+        const int r  = idx / SCW;
+        const int c  = idx - r * SCW;
+        const int gy = y0 + r;
+        const int gx = x0 - RAD + c;
+        s_in[(size_t)r * SCWP + c] = (gy < H && gx >= 0 && gx < W)
+                                     ? src[(size_t)gy * (sstep >> 2) + gx] : Op::ident();
+    }
+    __syncthreads();
+
+    if (y0 + tid < H) {                     // 一线程一行：窗口寄存器滑动
+        const float* rp = s_in + (size_t)tid * SCWP;
+        float* out      = s_out + (size_t)tid * SOUTP;
+        float w[K];
+#pragma unroll
+        for (int j = 0; j < K; ++j) w[j] = rp[j];
+#pragma unroll
+        for (int i = 0; i < TB; ++i) {
+            float v = w[0];
+#pragma unroll
+            for (int j = 1; j < K; ++j) v = op(v, w[j]);
+            out[i] = v;
+            if (i + 1 < TB) {
+#pragma unroll
+                for (int j = 0; j < K - 1; ++j) w[j] = w[j + 1];
+                w[K - 1] = rp[i + K];       // rp 已 clamp，直接续读
+            }
+        }
+    }
+    __syncthreads();
+
+    const int nc = min(TB, W - x0);
+    for (int idx = tid; idx < RB * nc; idx += RB) {   // 线性映射合并写回
+        const int r  = idx / nc;
+        const int c  = idx - r * nc;
+        const int gy = y0 + r;
+        if (gy < H) dst[(size_t)gy * (dstep >> 2) + x0 + c] = s_out[(size_t)r * SOUTP + c];
+    }
+}
+
+// cols：一线程一列，TB 行一段；窗口寄存器滑动；输出攒寄存器、段尾合并写回
+template <typename Op, int K, int TB>
+__global__ void morph32_cols_win_kernel(const float* __restrict__ src, size_t sstep,
+                                        float* __restrict__ dst, size_t dstep,
+                                        int W, int H)
+{
+    constexpr int RAD = K >> 1;
+    const int x  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y0 = blockIdx.y * TB;
+    if (x >= W) return;
+    const Op op;
+    const size_t rows = sstep >> 2, orows = dstep >> 2;
+
+    float w[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+        const int gy = y0 - RAD + j;
+        w[j] = (gy >= 0 && gy < H) ? src[(size_t)gy * rows + x] : Op::ident();
+    }
+    float out[TB];
+#pragma unroll
+    for (int i = 0; i < TB; ++i) {
+        float v = w[0];
+#pragma unroll
+        for (int j = 1; j < K; ++j) v = op(v, w[j]);
+        out[i] = v;
+        if (i + 1 < TB) {
+#pragma unroll
+            for (int j = 0; j < K - 1; ++j) w[j] = w[j + 1];
+            const int gy = y0 + i + RAD + 1;      // 窗口下移一格的新下端（clamp）
+            w[K - 1] = (gy < H) ? src[(size_t)gy * rows + x] : Op::ident();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TB; ++i) {
+        const int y = y0 + i;
+        if (y < H) dst[(size_t)y * orows + x] = out[i];
+    }
+}
+
+// 滑窗内核覆盖奇数 k ∈ [9,33]（与 u8 走查内核的 k≤33 对齐）；返回 false = 该轴走旧路径
+template <typename Op>
+bool morph32_rows_win(int k, const float* src, size_t sstep, float* tmp, size_t tstep,
+                      int W, int H, cudaStream_t stream)
+{
+    constexpr int TB = 8, RB = 128;
+    switch (k) {
+    case 9:  { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 9,  TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 11: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 11, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 13: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 13, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 15: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 15, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 17: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 17, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 19: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 19, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 21: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 21, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 23: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 23, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 25: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 25, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 27: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 27, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 29: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 29, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 31: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 31, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    case 33: { dim3 g((W + TB - 1) / TB, (H + RB - 1) / RB);
+               morph32_rows_win_kernel<Op, 33, TB, RB><<<g, RB, 0, stream>>>(src, sstep, tmp, tstep, W, H); return true; }
+    default: return false;
+    }
+}
+
+template <typename Op>
+bool morph32_cols_win(int k, const float* tmp, size_t tstep, float* dst, size_t dstep,
+                      int W, int H, cudaStream_t stream)
+{
+    constexpr int TB = 16;
+    switch (k) {
+    case 9:  { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 9,  TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 11: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 11, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 13: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 13, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 15: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 15, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 17: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 17, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 19: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 19, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 21: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 21, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 23: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 23, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 25: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 25, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 27: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 27, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 29: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 29, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 31: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 31, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    case 33: { dim3 g((W + 255) / 256, (H + TB - 1) / TB);
+               morph32_cols_win_kernel<Op, 33, TB><<<g, 256, 0, stream>>>(tmp, tstep, dst, dstep, W, H); return true; }
+    default: return false;
+    }
+}
+
 template <typename Op>
 void morph32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
              int width, int height, int kw, int kh, cudaStream_t stream)
@@ -716,12 +897,17 @@ void morph32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
     // 输出行会被下方 chunk 当输入读，block 间无同步 → 竞态（u8 版列遍读 tmp 同理）
     const size_t tstep = (size_t)width * 4;
     float* tmp = (float*)ws_grow(tstep * height + 1024);
-    dim3 g1((width + 255) / 256, height), t1(256);
-    morph32_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
-    const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
-    dim3 g2((width + 255) / 256, (height + rpt - 1) / rpt), t2(256);
-    morph32_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
-                                                   width, height, kh, rpt);
+    // r54：大核逐轴分派到滑窗寄存器内核（k∈[9,33] 奇数），其余仍走旧直加/ring 路径
+    if (!morph32_rows_win<Op>(kw, d_src, srcStep, tmp, tstep, width, height, stream)) {
+        dim3 g1((width + 255) / 256, height), t1(256);
+        morph32_rows_kernel<Op><<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+    }
+    if (!morph32_cols_win<Op>(kh, tmp, tstep, d_dst, dstStep, width, height, stream)) {
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2((width + 255) / 256, (height + rpt - 1) / rpt), t2(256);
+        morph32_cols_kernel<Op><<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                       width, height, kh, rpt);
+    }
 }
 
 } // namespace
