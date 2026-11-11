@@ -285,10 +285,31 @@ G:\cuda-kernel
          暂存宽度按最大用例开；② CK 宏在 void 函数里 `return 1` 编译错，分开 CK/CKV；
          ③ bench 口径 640 k=15 从 8.8x→30.2x 的跳跃里有一半是小图旧路径本就快、列遍
          sector 放大在小图上占比更高。
-- [ ] 下一步（r54 后候选，按性价比排序）：① k=7 morph/mean 的 16px/线程探针（r52 遗留，
-      4K 0.658ms / 3.79x，与 u8 k=3 的 5.0x 相比有空间）；② integral 1080p 80→86.5 GB/s
-      （收益 ≤8%，地板附近）；③ f32 小图 TH 微调（收益小）。f32 大核完成后 f32 家族
-      erode/dilate/mean 全部 ≥10x（除 k=3），无确定性 lose 待攻。
+- [x] 下一步（2026-11-11 r54 后 → 2026-11-12 r55 完成）①：**gaussian k=7 融合内核 TH 形状修正**
+      （BENCHMARK.md 第二十二轮）—— r52 给 integral 定的「每 SM ~4 常驻 block → nChunks≈24」
+      甜点规则，k=7 的 TH 分档从来没扫过（84 regs → 3 块/SM 常驻，老规则 4K TH=64 → nChunks=34）。
+      - 新探针 `probe_g7th`（TH∈{8,16,32,48,64,96,128} × 6 轮轮转起点交错 min + 逐 TH 正确性断言），
+        两轮排序一致：640 TH16、720p **TH32**（-16%）、1080p **TH96**（-9%）、4K TH128（-3%）。
+        4K 最优 TH128 与 r52 机制吻合（3 块/SM × 6 SM = 18 常驻 → TH≈ceil(2160/18)→128）。
+      - 定案：TH 分档改 `(H>=1600)?128:(H>800?96:(H>600?32:16))`，内核本体零改动。
+        bench 三轮（新二进制）120/120 WIN 零 lose；k=7 同轮配对 720p 0.112→0.096、
+        1080p 0.203→0.182、4K 0.652→0.645、640 打平偏好。
+      - **数据勘误**：r54 CSV 的 OpenCV gaussian 列被当时低时钟污染（720p k=7 记 1.47ms，
+        同机实测 0.33ms），r54「中位 20.9」系对手侧膨胀，r55 起聚合以本轮为准（min 1.27~1.30、
+        中位 9.1~9.3、p10 2.53~2.59）。
+      - **流程坑重演（r51 #3）**：改 src 后只重建了 obj+probe，忘了 build_all——前两轮 bench
+        跑的旧二进制。规则：**动 src/ 后必须 build_all.bat 再跑 smoke/bench**。
+      - 探针踩坑：cudaMallocPitch + 紧排 cudaMemcpy 布局错位 → 第一次全 FAIL 假阳性；
+        改 cudaMemcpy2D 后 sanity 全 0。虚惊反证「交叉 TH 比对」能抓 probe_s7 chunk 模式
+        的盲区（同 TH 两边同错相消），probe_g7th 保留为固定验证面。
+      - 验证：probe_g7th 7 档 × 4 尺寸 oop 逐位一致；probe_s7 check（默认+FORCE_STASH）+
+        chunk（CK_TH7=96/128）全 OK（新 TH 下 stash 槽位映射复验）；smoke 120 [OK]；
+        bench 三轮 CSV 落 docs/bench/bench_sm61_r55.csv（+ r55b 日志）。
+- [ ] 下一步（r55 后候选，按性价比排序）：① k=7 融合内核 16px/线程重写（真正的候选①，
+      r52 遗留；TH 已调到位但 8px/uint2 取数粒度没动，4K 0.635ms / 3.93x vs k=5 的
+      0.424ms / 4.57x，还有 ~35% 绝对差；难点：垂直 u32 lane 的 h[7][16] 寄存器爆炸，
+      要么改 dp2a 打包要么降 chunk 行数）② integral 1080p 80→86.5 GB/s（收益 ≤8%，地板附近）
+      ③ f32 小图 TH 微调（收益小）。
 - 同步状态（2026-11-10 r53 现场核实）：本轮 3 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
   归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志）+ 本条状态行补丁。
   每次 `bash scripts/push.sh` 都亲眼看到 `SYNC_OK <sha>`（依次 b95c8fc → 状态行后的 sha），

@@ -5,5 +5,5 @@ set "OPENCV_BIN=D:\opencv-cuda-build\install\x64\vc17\bin"
 :: =================================================
 set PATH=%OPENCV_BIN%;%CUDA_BIN%;%PATH%
 cd /d "%~dp0..\build"
-benchmark.exe 2>&1
+.enchmark.exe 2>&1
 echo BENCH_EXIT=%ERRORLEVEL%

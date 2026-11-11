@@ -725,6 +725,9 @@ void gauss7_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     case 8:  gauss7_fuse_kernel<8,  STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     case 16: gauss7_fuse_kernel<16, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     case 32: gauss7_fuse_kernel<32, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 48: gauss7_fuse_kernel<48, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 96: gauss7_fuse_kernel<96, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
+    case 128: gauss7_fuse_kernel<128, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     default: gauss7_fuse_kernel<64, STASH><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height, stash, stashStep); break;
     }
 }
@@ -749,13 +752,13 @@ bool stash7_enabled(int height)
     return s && s[0] == '1';
 }
 
-// TH 覆盖（仅 probe 用：CK_TH7=8/16/32/64 遍历 chunk 组合）
+// TH 覆盖（仅 probe 用：CK_TH7=8/16/32/48/64/96/128 遍历 chunk 组合）
 int th7_override(int def)
 {
     const char* s = getenv("CK_TH7");
     if (!s) return def;
     const int v = atoi(s);
-    return (v == 8 || v == 16 || v == 32 || v == 64) ? v : def;
+    return (v == 8 || v == 16 || v == 32 || v == 48 || v == 64 || v == 96 || v == 128) ? v : def;
 }
 
 } // anonymous namespace
@@ -885,7 +888,13 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
                             (srcStep % 8 == 0) && (dstStep % 8 == 0) &&
                             ((uintptr_t)d_src % 8 == 0) && ((uintptr_t)d_dst % 8 == 0));
         if (fuse7) {
-            const int TH = th7_override((height >= 1600) ? 64 : (height > 800 ? 16 : 8));
+            // TH 分档（2026-11-12 r55，probe_g7th 7 档 × 6 轮轮转交错 min，两轮排序一致）：
+            //   640 TH16 0.0430（旧 TH8 0.0451）；720p TH32 0.0758（旧 TH8 0.0901，-16%）；
+            //   1080p TH96 0.1679（旧 TH16 0.1853，-9%）；4K TH128 0.6164（旧 TH64 0.6349，-3%）。
+            // 4K 最优与 r52 integral 的机制逻辑吻合：84 regs → 3 块/SM 常驻 → 6SM×3=18 常驻
+            // block → nChunks≈18 → TH≈ceil(2160/18)=120→128。小图由 barrier 固定成本主导，
+            // 机制不适用，直接按实测分档。老规则 (H>=1600)?64:(H>800?16:8) 作废。
+            const int TH = th7_override((height >= 1600) ? 128 : (height > 800 ? 96 : (height > 600 ? 32 : 16)));
             if (inplace7) {
                 // 2026-11-05 r48：k=7 也走 stash（同 k=5 的机制，R=3）。r46 记录过的「4K 原地偶发
                 // diff」在本轮 probe_s7 里按 12 种 TH/形状组合 × 多轮重跑做了复核，详见 BENCHMARK
