@@ -608,6 +608,10 @@ void gauss5_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
 // 约束：W%8==0 且 8<=W<=4096、8B 对齐、H>=4；其它回退两遍路径。
 //   H<4 特意回退：H=3 时两遍路径的单次折叠+clamp 与 REFLECT_101 周期镜像本就不同（旧行为），
 //   融合路径（严格周期镜像）虽更接近数学定义，但会改变该角落的既有输出，故不动它。
+// 垂直寄存器打包（2026-11-13 r56，probe_g7px V1）：行和 ≤16320 装 u16，相邻行对
+// (h0,h1)(h2,h3)(h4,h5) 打成 3 个 u32 + h6 单份 → 垂直寄存器 56→32，84 regs 降到
+// ~60 → 4 块/SM 常驻（原 3 块）。垂直和 = 3 条 __dp2a_lo(u8x4 权重对) + 1 IMAD，
+// 全 u32 精确，与旧 8 条 IMAD 版逐位一致（probe_g7px V1 全形状 diff=0）。
 __device__ __forceinline__ int g7_mirror(int i, int len)
 {
     if (len <= 1) return 0;
@@ -625,6 +629,9 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
 {
     constexpr uint K1 = 2u | (7u << 8) | (14u << 16) | (18u << 24);   // taps x-3..x
     constexpr uint K2 = 14u | (7u << 8) | (2u << 16);                 // taps x+1..x+4（末位权重 0）
+    constexpr uint KA = 2u | (7u << 8);      // dp2a_lo(P01): 2·h0 + 7·h1
+    constexpr uint KB = 14u | (18u << 8);    // dp2a_lo(P23): 14·h2 + 18·h3
+    constexpr uint KC = 14u | (7u << 8);     // dp2a_lo(P45): 14·h4 + 7·h5
     const int tid  = threadIdx.x;
     const int gx   = (blockIdx.x * blockDim.x + tid) * 8;
     const int y0   = blockIdx.y * TH;
@@ -634,7 +641,7 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
     const bool act = (gx < W);
     const int gxl  = act ? gx : (W - 8);     // 非活跃线程给 8B 对齐安全地址，仍参与 shuffle
 
-    uint h[7][8];
+    uint P01[8], P23[8], P45[8], h6[8];      // Pab = h_a | h_b<<16（各 ≤16320，无溢出）
 
     // 一行 8 像素的水平 7-tap 和（≤16320）
     auto hrow = [&](int ry, uint o[8]) {
@@ -674,8 +681,23 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
         for (int i = 0; i < 8; ++i) o[i] = __dp4a(rw[i], K2, __dp4a(lw[i], K1, 0u));
     };
 
+    // 预载 y0-3..y0+3 打包成 3 对 + h6（行号按 REFLECT_101 镜像）
+    {
+        uint t[8], u[8];
+        hrow(g7_mirror(y0 - 3, H), t);
+        hrow(g7_mirror(y0 - 2, H), u);
 #pragma unroll
-    for (int i = 0; i < 7; ++i) hrow(g7_mirror(y0 - 3 + i, H), h[i]);
+        for (int k = 0; k < 8; ++k) P01[k] = t[k] | (u[k] << 16);
+        hrow(g7_mirror(y0 - 1, H), t);
+        hrow(g7_mirror(y0 + 0, H), u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) P23[k] = t[k] | (u[k] << 16);
+        hrow(g7_mirror(y0 + 1, H), t);
+        hrow(g7_mirror(y0 + 2, H), u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) P45[k] = t[k] | (u[k] << 16);
+        hrow(g7_mirror(y0 + 3, H), h6);
+    }
     if (STASH) __syncthreads();     // 同 k=5：预载读本块自己的行，快的 warp 可能已经在写
 
     for (int y = y0; y < y1; ++y) {
@@ -685,10 +707,10 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
             uint p[8];
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                const uint U  = h[0][k] + h[6][k];
-                const uint V  = h[1][k] + h[5][k];
-                const uint Wd = h[2][k] + h[4][k];
-                const uint S  = 7u * (V + 2u * Wd) + 2u * U + 18u * h[3][k];  // ≤1,044,480
+                // S = 2h0+7h1+14h2+18h3+14h4+7h5+2h6 ≤ 1,044,480（u32 精确）
+                const uint S  = __dp2a_lo(P45[k], KC,
+                                  __dp2a_lo(P23[k], KB,
+                                    __dp2a_lo(P01[k], KA, 2u * h6[k])));
                 const int v = __float2int_rn((float)S * (1.f / 4096.f));       // 与两遍路径同语义
                 p[k] = (uint)max(0, min(255, v));
             }
@@ -699,8 +721,11 @@ __global__ void gauss7_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep
         }
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
-            h[0][k] = h[1][k]; h[1][k] = h[2][k]; h[2][k] = h[3][k]; h[3][k] = h[4][k];
-            h[4][k] = h[5][k]; h[5][k] = h[6][k]; h[6][k] = hn[k];
+            // 新窗口 = (h1..h6, hn)：P01'=(h1,h2) P23'=(h3,h4) P45'=(h5,h6) h6'=hn
+            const uint a = __funnelshift_r(P01[k], P23[k], 16);
+            const uint b = __funnelshift_r(P23[k], P45[k], 16);
+            P45[k] = (P45[k] >> 16) | (h6[k] << 16);
+            P01[k] = a; P23[k] = b; h6[k] = hn[k];
         }
         if (STASH) __syncthreads();     // 同 k=5：块内 warp 超车会把预取行读成已写数据
     }
