@@ -305,11 +305,31 @@ G:\cuda-kernel
       - 验证：probe_g7th 7 档 × 4 尺寸 oop 逐位一致；probe_s7 check（默认+FORCE_STASH）+
         chunk（CK_TH7=96/128）全 OK（新 TH 下 stash 槽位映射复验）；smoke 120 [OK]；
         bench 三轮 CSV 落 docs/bench/bench_sm61_r55.csv（+ r55b 日志）。
-- [ ] 下一步（r55 后候选，按性价比排序）：① k=7 融合内核 16px/线程重写（真正的候选①，
-      r52 遗留；TH 已调到位但 8px/uint2 取数粒度没动，4K 0.635ms / 3.93x vs k=5 的
-      0.424ms / 4.57x，还有 ~35% 绝对差；难点：垂直 u32 lane 的 h[7][16] 寄存器爆炸，
-      要么改 dp2a 打包要么降 chunk 行数）② integral 1080p 80→86.5 GB/s（收益 ≤8%，地板附近）
-      ③ f32 小图 TH 微调（收益小）。
+- [x] 下一步（2026-11-12 r55 后 → 2026-11-13 r56 完成）①：**gaussian k=7 融合内核垂直寄存器打包**
+      （BENCHMARK.md 第二十三轮）—— r52 遗留候选①的原始形态（16px/线程 + uint4）被探针实测
+      否掉，换成 8px 不变、垂直行和对打包 + dp2a 的路线。
+      - 新探针 `probe_g7px`（`docs/probes/probe_g7px.cu`）：V1 = 8px + 行和对打包
+        (h0,h1)(h2,h3)(h4,h5)+h6，垂直和 3 条 `__dp2a_lo` + 1 IMAD；V2 = 16px/线程 + uint4
+        （r52 原方案）。两轮 6 轮轮转交错 A/B：**V1 4K 1.19x（0.445→0.374ms）、640 1.17x、
+        720p 1.04x、1080p 0.96x**；V2 全尺寸 0.91~0.97x 被否——16px 的寄存器爆炸
+        （h[7][16]=112 regs → ~150 → 1 块/SM）压过了 uint4 的访存收益。
+      - **机制**：行和 ≤16320 装 u16，相邻行对打包成 3 个 u32 + h6 单份 → 垂直寄存器
+        56→32，84 regs → ~60 → 4 块/SM 常驻（原 3 块）。垂直和 u32 精确，与旧 8 条
+        IMAD 版逐位一致。
+      - **V2 的 3 个探针踩坑**（调试耗时很长，记录防重蹈）：① `__funnelshift_r(lo,hi,s)`
+        参数序是 (低位,高位)，首版当 (hi,lo) 写导致 CPU 仿真与 GPU 全错位；② 窗循环三元链
+        `(a==1)?W3:(a==2)?W4:W5` 漏 a==0 分支（a=0 落到 W5，rw[0..3] 全错）——「穷举反推窗字节」
+        定位；③ shfl 放进 if/else 分支是 UB（边界 lane 不参与）→ 必须**无条件执行 + 分支覆盖**
+        （旧内核的同构写法是对的）。V2 仍有 tid≥1 窗循环异常（输出错、dump 显示 lw/rw 恒定），
+        未定案前不集成，探针注释保留现场。
+      - **集成**：`gauss7_fuse_kernel` 垂直存储 h[7][8] → P01/P23/P45/h6，滚动改 2 条
+        funnelshift + 1 打包/像素。smoke 120 [OK]；probe_g7th 7 档 TH sanity 全 0；
+        probe_s7 check+chunk 全 OK（stash 路径同内核模板兼容）。
+      - 结果（probe_g7px V0=新 src 口径）：4K 0.445→**0.375**、640 0.035→0.029、
+        720p 打平、1080p 0.96x；bench 两轮 CSV 落 docs/bench/bench_sm61_r56*.csv。
+- [ ] 下一步（r56 后候选，按性价比排序）：① V2 的 tid≥1 窗循环异常见 probe_g7px 注释，
+      若定案可量化 16px 路线（当前证据 0.91~0.97x，即使修好也难赢）；② integral 1080p
+      80→86.5 GB/s（收益 ≤8%，地板附近）③ f32 小图 TH 微调（收益小）。
 - 同步状态（2026-11-10 r53 现场核实）：本轮 3 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
   归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志）+ 本条状态行补丁。
   每次 `bash scripts/push.sh` 都亲眼看到 `SYNC_OK <sha>`（依次 b95c8fc → 状态行后的 sha），
