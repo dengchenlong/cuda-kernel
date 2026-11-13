@@ -913,13 +913,16 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
                             (srcStep % 8 == 0) && (dstStep % 8 == 0) &&
                             ((uintptr_t)d_src % 8 == 0) && ((uintptr_t)d_dst % 8 == 0));
         if (fuse7) {
-            // TH 分档（2026-11-12 r55，probe_g7th 7 档 × 6 轮轮转交错 min，两轮排序一致）：
-            //   640 TH16 0.0430（旧 TH8 0.0451）；720p TH32 0.0758（旧 TH8 0.0901，-16%）；
-            //   1080p TH96 0.1679（旧 TH16 0.1853，-9%）；4K TH128 0.6164（旧 TH64 0.6349，-3%）。
-            // 4K 最优与 r52 integral 的机制逻辑吻合：84 regs → 3 块/SM 常驻 → 6SM×3=18 常驻
-            // block → nChunks≈18 → TH≈ceil(2160/18)=120→128。小图由 barrier 固定成本主导，
-            // 机制不适用，直接按实测分档。老规则 (H>=1600)?64:(H>800?16:8) 作废。
-            const int TH = th7_override((height >= 1600) ? 128 : (height > 800 ? 96 : (height > 600 ? 32 : 16)));
+            // TH 分档（2026-11-12 r55，probe_g7th 7 档 × 6 轮轮转交错 min，两轮排序一致；
+            // 2026-11-14 r57 按垂直打包后的新占用率重扫，两轮排序仍一致）：
+            //   r55 旧内核 84 regs → 3 块/SM：640 TH16、720p TH32、1080p TH96、4K TH128。
+            //   r56 垂直寄存器打包 84→~60 regs → 4 块/SM → 6SM×4=24 常驻 → nChunks≈24 甜点
+            //   （与 r52 integral 同机制）。r57 重扫两轮：720p TH32 0.0758/0.0768*（nChunks=23
+            //   已在甜点，不动）；1080p **TH48 0.1388/0.1403（TH96 0.176/0.177，-21%）**、
+            //   4K **TH96 0.4915*两轮同值（TH128 0.540/0.544，-9%）**——两个大图甜点都精确
+            //   落在 nChunks=23（≈24），机制自洽。640 TH8 只赢 2.6%（噪声带内）且 r55 旧内核
+            //   实测反向，保守不动。
+            const int TH = th7_override((height >= 1600) ? 96 : (height > 800 ? 48 : (height > 600 ? 32 : 16)));
             if (inplace7) {
                 // 2026-11-05 r48：k=7 也走 stash（同 k=5 的机制，R=3）。r46 记录过的「4K 原地偶发
                 // diff」在本轮 probe_s7 里按 12 种 TH/形状组合 × 多轮重跑做了复核，详见 BENCHMARK
