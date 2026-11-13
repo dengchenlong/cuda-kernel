@@ -346,13 +346,13 @@ G:\cuda-kernel
 - [ ] 下一步（r57 后候选，按性价比排序）：① V2 的 tid≥1 窗循环异常见 probe_g7px 注释，
       若定案可量化 16px 路线（当前证据 0.91~0.97x，即使修好也难赢）；② integral 1080p
       80→86.5 GB/s（收益 ≤8%，地板附近）③ f32 小图 TH 微调（收益小）。
-- 同步状态（2026-11-10 r53 现场核实）：本轮 3 个 commit —— `d5d8271`（morph 走查内核 + probe_mcol
-  归档）+ `b95c8fc`（BENCHMARK 第二十轮 + PROGRESS + r53 CSV + 原始日志）+ 本条状态行补丁。
-  每次 `bash scripts/push.sh` 都亲眼看到 `SYNC_OK <sha>`（依次 b95c8fc → 状态行后的 sha），
-  并用 `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致、`git status` 干净
-  （工作区只剩 .gitignore 的 build/ 产物）。本地分支仍只有 `main` + 两个已合入 main 的
-  `spike-hist4k` / `spike-clock-lock`（非遗留问题）。**r52 的 `ca7a9a4`/`ddfb959` 已不再是最新，
-  勿再引用。**（以上均为本轮现场核实，非照抄。）
+- 同步状态（2026-11-14 r57 现场核实）：本轮 1 个 commit —— `7cf63e5`（gaussian k=7 TH 重扫
+  96/48/32/16 + run_bench.bat 坏字节修复 + BENCHMARK 第二十四轮 + PROGRESS + 两轮 CSV）。
+  `bash scripts/push.sh` 亲眼看到 `SYNC_OK 7cf63e5`；`git ls-remote --heads origin main` 与
+  `git rev-parse HEAD` 核对一致（7cf63e5）、`git status` 干净。本地分支仍只有 `main` + 两个
+  已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
+  **r56 的 `d1dce83`/`fb9e7db` 已被本轮覆盖为父提交，引用最新请用 `7cf63e5`。**
+  （以上均为本轮现场核实，非照抄。）
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
