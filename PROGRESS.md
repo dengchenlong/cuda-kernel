@@ -343,16 +343,35 @@ G:\cuda-kernel
         （`.\benchmark.exe` 的 `\` 变 `\b`，路径里 `\v12.5\bin` 同病），r55/r56 的 bench
         实际是绕过 bat 直接跑的；本轮第一次 9009 报错暴露，python 按字节修复重写
         （其余 scripts/*.bat 扫描无同类坏字节）。
-- [ ] 下一步（r57 后候选，按性价比排序）：① V2 的 tid≥1 窗循环异常见 probe_g7px 注释，
-      若定案可量化 16px 路线（当前证据 0.91~0.97x，即使修好也难赢）；② integral 1080p
-      80→86.5 GB/s（收益 ≤8%，地板附近）③ f32 小图 TH 微调（收益小）。
-- 同步状态（2026-11-14 r57 现场核实）：本轮 1 个 commit —— `7cf63e5`（gaussian k=7 TH 重扫
-  96/48/32/16 + run_bench.bat 坏字节修复 + BENCHMARK 第二十四轮 + PROGRESS + 两轮 CSV）。
-  `bash scripts/push.sh` 亲眼看到 `SYNC_OK 7cf63e5`；`git ls-remote --heads origin main` 与
-  `git rev-parse HEAD` 核对一致（7cf63e5）、`git status` 干净。本地分支仍只有 `main` + 两个
+- [x] 下一步（2026-11-14 r57 后 → 2026-11-15 r58 完成）：① 候选①定案关闭 —— V2「tid≥1 窗
+      循环异常」根因查明是**探针代码三个真 bug**，修复后正确性全过但性能定案否决；
+      ② gaussian-f32 k=5 TH 重扫（新探针 probe_gf32th，BENCHMARK.md 第二十五轮）。
+  1) **V2 三 bug**（probe_g7px）：① hrow 末尾残留**无花括号的 `if (tid==0&&b0&&b1)`** 吞掉
+     整个 lw/rw 计算循环（tid≥1 恒定垃圾值 = PROGRESS 旧记录「lw/rw 恒定」的真身）；
+     ② `gxl==0` 时 pv4 只拼 3B 而 W0 取低 3B —— 内部 lane 的 W0 拿到 px12..14 差一字节，
+     统一为 4B 流 B[-4..-1]、W0 取 `pv4>>8`；③ nv 边界拼序旧注释写反（拼序本身对）。
+     修复后 14 形状+极值 badTotal=0（辅以 probe_v2diag/probe_v2diag2 独立复现逐位通过）。
+  2) **性能否决**：正确 V2 640 0.94x / 720p 1.00x / 1080p 0.58x / 4K 0.68x（6 轮交错 min）
+     —— h[7][16]=112 regs 寄存器爆炸压占用率，比坏版估的 0.91~0.97x 还差。**候选①关闭，
+     不再重开**；probe_g7px 保留为流字窗口推导的正确参考实现。
+  3) **gaussian-f32 TH 重扫**（probe_gf32th：7 档 × 4 尺寸 × 6 轮交错 min + 逐 TH 正确性），
+     三轮排序逐轮一致：640→16（-12%）、720p→64（-4%）、1080p→96（-9%）、4K→128（-2%）。
+     定案 `(H>=1600)?128:(H>1000?96:(H>600?64:16))`，内核本体零改动。
+  4) **流程坑（r51 #3 又一形态）**：build_probe.bat 编译 `build\<name>.cu`，改 docs\probes\ 源
+     必须先 cp 过去再编 —— 本轮前三次「改完仍错」皆因此。
+  - 验证：smoke 120 [OK] ×2；bench 两轮均 **120/120 WIN 零 lose**（r58a min 1.694 / r58b
+    min 1.616，中位 8.741/9.167）；gaussian-f32 k=5 配对 640 2.59→2.68x、720p 2.32→2.56x、
+    1080p 2.63→2.85x、4K 2.68→2.70x。CSV 落 docs/bench/bench_sm61_r58*.csv。
+- [ ] 下一步（r58 后候选，按性价比排序）：① integral 1080p 80→86.5 GB/s（收益 ≤8%，
+      地板附近，r52 遗留）；② morph-f32 大核之外的 r52 遗留 k=7 16px/线程已随候选①关闭；
+      ③ 全部算子已 120/120 WIN 且最低项 1.6x+，若无新需求可转周期性健康巡检。
+- 同步状态（2026-11-15 r58 现场核实）：本轮 2 个 commit —— `a188f4e`（probe_g7px V2 三 bug
+  修复 + 候选①关闭 + probe_v2diag/v2diag2）与 gaussian-f32 TH 重扫 commit（见 git log）。
+  push 结果见日报【剩余事项】（本轮现场核实后填写）。本地分支仍只有 `main` + 两个
   已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
-  **r56 的 `d1dce83`/`fb9e7db` 已被本轮覆盖为父提交，引用最新请用 `7cf63e5`。**
-  （以上均为本轮现场核实，非照抄。）
+  （以上为本轮现场核实，非照抄。）
+- 上一轮同步状态（2026-11-14 r57，历史）：commit `7cf63e5`，SYNC_OK 7cf63e5；
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致、`git status` 干净。
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）

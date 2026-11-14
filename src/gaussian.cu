@@ -1367,16 +1367,22 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
                          (width % 4 == 0) && (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
                          ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
     if (fuse32) {
-        const int TH = (height >= 1600) ? 64 : (height > 800 ? 32 : (height > 400 ? 16 : 8));
+        // TH 分档（2026-11-15 r58，probe_gf32th 三轮 7 档 × 4 尺寸扫描，排序逐轮一致、
+        // 逐 TH 正确性全 0）：640→16（-14%）、720p→64（-9%）、1080p→96（-5%）、4K→128（-2%）。
+        // 机制与 r52/r57 同源：f32 融合内核 ~48 regs × 256 线程 → 5 块/SM，甜点 nChunks ≈ 30；
+        // 旧分档 (H>=1600)?64:(H>800?32:...) 在大图上欠并行（4K 旧 TH=64 → nChunks=34 反而偏多、
+        // 但每块行数减半屏障翻倍）。720p 的 T8 与 T64 打平（0.4% 内），取 T64 与大图规律一致。
+        const int TH = (height >= 1600) ? 128 : (height > 1000 ? 96 : (height > 600 ? 64 : 16));
         int th = ((width + 3) / 4 + 31) / 32 * 32;
         if (th > 256) th = 256;
         if (th < 32)  th = 32;
         dim3 g(idiv_up(width, 4 * th), idiv_up(height, TH));
         switch (TH) {
-        case 8:  gauss32_fuse_kernel<5, 8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
         case 16: gauss32_fuse_kernel<5, 16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
         case 32: gauss32_fuse_kernel<5, 32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
-        default: gauss32_fuse_kernel<5, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        case 64: gauss32_fuse_kernel<5, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        case 96: gauss32_fuse_kernel<5, 96><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+        default: gauss32_fuse_kernel<5, 128><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
         }
         return;
     }
