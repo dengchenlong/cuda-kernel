@@ -366,8 +366,10 @@ G:\cuda-kernel
       地板附近，r52 遗留）；② morph-f32 大核之外的 r52 遗留 k=7 16px/线程已随候选①关闭；
       ③ 全部算子已 120/120 WIN 且最低项 1.6x+，若无新需求可转周期性健康巡检。
 - 同步状态（2026-11-15 r58 现场核实）：本轮 2 个 commit —— `a188f4e`（probe_g7px V2 三 bug
-  修复 + 候选①关闭 + probe_v2diag/v2diag2）与 gaussian-f32 TH 重扫 commit（见 git log）。
-  push 结果见日报【剩余事项】（本轮现场核实后填写）。本地分支仍只有 `main` + 两个
+  修复 + 候选①关闭 + probe_v2diag/v2diag2）与 `70e5465`（gaussian-f32 TH 重扫 + BENCHMARK
+  第二十五轮 + PROGRESS + 两轮 CSV）。`bash scripts/push.sh` 亲眼看到 `SYNC_OK 70e5465`
+  （第一次尝试 TLS 中断 SYNC_FAIL，重试成功）；`git ls-remote --heads origin main` 与
+  `git rev-parse HEAD` 核对一致（70e5465）、`git status` 干净。本地分支仍只有 `main` + 两个
   已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
   （以上为本轮现场核实，非照抄。）
 - 上一轮同步状态（2026-11-14 r57，历史）：commit `7cf63e5`，SYNC_OK 7cf63e5；
