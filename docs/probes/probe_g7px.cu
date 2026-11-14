@@ -1,13 +1,23 @@
-// probe_g7px：gaussian k=7 融合内核改进评估（r56 候选①）
+// probe_g7px：gaussian k=7 融合内核改进评估（r56 候选①，r58 定案关闭）
 // 现状（r55 后）：8px/线程 + uint2 + 垂直 u32 lane 8 条 IMAD，84 regs → 3 块/SM。
 // 两个变体（都只测 out-of-place，与默认路径逐位比对）：
 //   V1 = 8px 不变，但 7 个行和按 (h0,h1)(h2,h3)(h4,h5) 打成 3 个 u32 对 + h6，
-//        垂直和用 3 条 dp2a + 1 IMAD（行和 ≤16320 装 u16，两两打包；滚动 = 2 条 fsl + 1 打包/像素）。
-//        动机：行存储 56 regs → 32 regs，目标 ~60 regs → 4 块/SM（65536/(60*256)=4.27）。
-//   V2 = 16px/线程 + uint4 取数/写回（r52 遗留的原方案）。窗口推导：字节流 S[k]=B[k-3]，
-//        6 个流字 W0..W5（每字 4 流字节），全部 32 个 4B 窗 = fsl(W[p/4], W[p/4+1], 8*(p%4))。
-//        预期代价 h[7][16]=112 regs → ~150 → 1 块/SM，直接量化这条路的真实收益/损失。
+//        垂直和用 3 条 dp2a + 1 IMAD。→ r56 已集成进 src/gaussian.cu（本轮基准 V0）。
+//   V2 = 16px/线程 + uint4 取数/写回。
+// **r58 定案（候选①关闭）**：PROGRESS 里「V2 tid≥1 窗循环异常」根因查明，是探针代码里
+//   三个真 bug（不是 GPU 侧诡异问题）：
+//   ① hrow 末尾残留一行无花括号的 `if (tid==0 && blockIdx.x==0 && blockIdx.y==0)`，
+//      把整个 lw/rw 计算循环吞进 if 体 —— tid≥1 线程 lw/rw 从未计算（恒定垃圾值）；
+//   ② 右 halo nv 的 shfl 值会先被非边界覆盖逻辑错位（shfl 先行、边界 lane 覆盖在后，
+//      顺序本身对，但旧注释的拼序描述是反的，误导排查）；
+//   ③ 左 halo pv4：gxl==0 分支只拼 3 字节 B[-3..-1]，而 W0 取 pv4 的低 3 字节 ——
+//      两种口径不一致，内部 lane 的 W0 实际拿到 px12..14（差一字节）。
+//   修完后 V2 正确性全过（14 形状 + 极值 badTotal=0），但性能实测**全面落败**：
+//   640 0.94x / 720p 1.00x / 1080p 0.70x / 4K 0.68x（6 轮交错 min）——
+//   16px 的 h[7][16]=112 regs 寄存器爆炸压占用率，比坏版本估的 0.91~0.97x 还差。
+//   **V2 正式否决，不再重开**；探针保留为「流字窗口推导」的参考实现（已验证正确）。
 // 口径：正确性先行（形状扫描 + 极值图），再 6 轮轮转交错 A/B min。
+// 注：V1 计时分支的 TH 分档已同步 r57 结论 (H>=1600)?96:(H>800?48:(H>600?32:16))。
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -176,8 +186,10 @@ __global__ void g7px_v2_kernel(const uint8_t* __restrict__ src, size_t sstep,
         // shfl 必须全 warp 无条件执行（走分支的 lane 不参与 shfl 是 UB），边界 lane 覆盖
         uint pv4 = __shfl_up_sync(0xffffffffu, w.w, 1);  // 前线程 px12..15 = 本线程 B[-4..-1]
         if (gxl == 0) {
-            // REFLECT_101：B[-3]=px3, B[-2]=px2, B[-1]=px1 → 直接按流序拼（b3 无用）
-            pv4 = (uint)rp[3] | ((uint)rp[2] << 8) | ((uint)rp[1] << 16);
+            // 统一为 4 字节流 B[-4..-1]（b0=B[-4]）：镜像 px4,px3,px2,px1。
+            // （旧版这里只拼 3 字节 B[-3..-1]，而 W0 又取 pv4 低 3 字节 —— 两种口径不一致，
+            //   内部 lane 的 W0 因此拿到 px12..14 而非 px13..15，差一字节 = V2 第三个 bug）
+            pv4 = (uint)rp[4] | ((uint)rp[3] << 8) | ((uint)rp[2] << 16) | ((uint)rp[1] << 24);
         } else if (lane == 0) {
             pv4 = *(const uint*)(rp + gxl - 4);
         }
@@ -185,6 +197,8 @@ __global__ void g7px_v2_kernel(const uint8_t* __restrict__ src, size_t sstep,
         uint nv = __shfl_down_sync(0xffffffffu, w.x, 1); // 后线程 px16..19 = B[16..19]
         if (gxl + 16 >= W) {
             // REFLECT_101：B[16+k] = px(2W-2-(gxl+16)-k)（镜像地址递减），k=0..3
+            // 流序 b0=B[16]=px(q0)（q0 最大镜像地址），b1=B[17]=px(q0-1)…→ q[0],q[-1],q[-2],q[-3]
+            // （r58 曾误改此拼序为「反转」，实测反转是错的 —— 此处原拼序本来就对，已还原）
             const int q0 = 2 * (W - 1) - (gxl + 16);
             const uint8_t* q = rp + q0;
             nv = (uint)q[0] | ((uint)q[-1] << 8) | ((uint)q[-2] << 16) | ((uint)q[-3] << 24);
@@ -193,16 +207,18 @@ __global__ void g7px_v2_kernel(const uint8_t* __restrict__ src, size_t sstep,
         }
         // 流字：W0=S[0..3]=B[-3..0]，W1=B[1..4]，W2=B[5..8]，W3=B[9..12]，W4=B[13..16]，W5=B[17..20]
         const uint Warr[6] = {
-            (pv4 & 0xffffffu) | (w.x << 24),            // W0 = B[-3],B[-2],B[-1],px0
+            (pv4 >> 8) | (w.x << 24),                   // W0 = B[-3],B[-2],B[-1],px0（pv4 现为 4B 流 B[-4..-1]）
             __funnelshift_r(w.x, w.y, 8),               // W1 = px1..px4
             __funnelshift_r(w.y, w.z, 8),               // W2 = px5..px8
             __funnelshift_r(w.z, w.w, 8),               // W3 = px9..px12
             __funnelshift_r(w.w, nv, 8),                // W4 = px13..px16
             nv >> 8,                                    // W5 = B[17..20]
         };
-        if (tid == 0 && blockIdx.x == 0 && blockIdx.y == 0)
         // lw[l] = B[l-3..l] = S[l..l+3] → 位置 p=l；rw[l] = B[l+1..l+4] = S[l+4..l+7] → p=l+4
         // 窗(p) = fsl(W[p/4], W[p/4+1], 8*(p%4))（p%4==0 时 fsl(x,y,0) = x|y<<16）
+        // r58 修复：原版这里有一行残留的 `if (tid==0 && blockIdx.x==0 && blockIdx.y==0)`
+        // 且无花括号，把整个 lw/rw 计算循环吞进了 if 体内 —— tid≥1 线程 lw/rw 从未计算
+        // （恒定垃圾值），这就是 PROGRESS 里「V2 tid≥1 窗循环异常」的根因。直接删掉该 if。
 #pragma unroll
         for (int a = 0; a < 4; ++a) {
             // 窗(p)：p%4==0 → W[p/4] 本身（4 字节流字已对齐）；否则 fsl(W[p/4], W[p/4+1], 8*(p%4))
@@ -264,13 +280,14 @@ static double timeFn(uint8_t* dA, size_t astep, uint8_t* dB, size_t bstep, int W
         if (which == 0) {
             gpu_gaussian(dA, astep, dB, bstep, W, H, 7, 0.f);
         } else {
-            const int TH = (H >= 1600) ? 128 : (H > 800 ? 96 : (H > 600 ? 32 : 16));
+            const int TH = (H >= 1600) ? 96 : (H > 800 ? 48 : (H > 600 ? 32 : 16));
             if (which == 1) {
                 const int th = ((W + 7) / 8 + 31) / 32 * 32;
                 dim3 g((unsigned)((W + 8 * th - 1) / (8 * th)), (unsigned)((H + TH - 1) / TH));
                 switch (TH) {
                 case 16: g7px_v1_kernel<16><<<g, th>>>(dA, astep, dB, bstep, W, H); break;
                 case 32: g7px_v1_kernel<32><<<g, th>>>(dA, astep, dB, bstep, W, H); break;
+                case 48: g7px_v1_kernel<48><<<g, th>>>(dA, astep, dB, bstep, W, H); break;
                 case 96: g7px_v1_kernel<96><<<g, th>>>(dA, astep, dB, bstep, W, H); break;
                 default: g7px_v1_kernel<128><<<g, th>>>(dA, astep, dB, bstep, W, H); break;
                 }
