@@ -362,18 +362,30 @@ G:\cuda-kernel
   - 验证：smoke 120 [OK] ×2；bench 两轮均 **120/120 WIN 零 lose**（r58a min 1.694 / r58b
     min 1.616，中位 8.741/9.167）；gaussian-f32 k=5 配对 640 2.59→2.68x、720p 2.32→2.56x、
     1080p 2.63→2.85x、4K 2.68→2.70x。CSV 落 docs/bench/bench_sm61_r58*.csv。
-- [ ] 下一步（r58 后候选，按性价比排序）：① integral 1080p 80→86.5 GB/s（收益 ≤8%，
-      地板附近，r52 遗留）；② morph-f32 大核之外的 r52 遗留 k=7 16px/线程已随候选①关闭；
-      ③ 全部算子已 120/120 WIN 且最低项 1.6x+，若无新需求可转周期性健康巡检。
-- 同步状态（2026-11-15 r58 现场核实）：本轮 2 个 commit —— `a188f4e`（probe_g7px V2 三 bug
-  修复 + 候选①关闭 + probe_v2diag/v2diag2）与 `70e5465`（gaussian-f32 TH 重扫 + BENCHMARK
-  第二十五轮 + PROGRESS + 两轮 CSV）。`bash scripts/push.sh` 亲眼看到 `SYNC_OK 70e5465`
-  （第一次尝试 TLS 中断 SYNC_FAIL，重试成功）；`git ls-remote --heads origin main` 与
-  `git rev-parse HEAD` 核对一致（70e5465）、`git status` 干净。本地分支仍只有 `main` + 两个
+- [x] 下一步（2026-11-15 r58 后 → 2026-11-16 r59 完成）：候选①定案关闭 + 周期性健康巡检 r59。
+  1) **候选①（integral 1080p 80→86.5 GB/s）判为伪命题，关闭**：r52 的 86.5 GB/s「纯搬运地板」
+     只在 4K 实测过，被错套到 1080p 上。重跑 probe_int9（3 轮交错 min）补齐分尺寸地板：
+     640 36.6 / 720p 63.4 / **1080p 79.1**（0.1311ms）/ 4K 87.7 GB/s —— 尺寸越小 DRAM 效率越低，
+     1080p 融合内核 ~80 GB/s 已贴住同尺寸地板（与 4K「融合版略超地板」同机制：每线程连续扫行
+     ILP 更好）。**integral 全尺寸到顶，该方向不再重开。**
+  2) 巡检 r59（无代码改动，二进制=r58）：smoke 全绿（120 [OK]，0 flagged）；bench 两轮均
+     **120/120 WIN 零 lose**（r59a min 1.212 / r59b min 1.440，中位 9.32/9.76，max 46.15/46.92）。
+     CSV 落 docs/bench/bench_sm61_r59a.csv / bench_sm61_r59b.csv。
+  3) 环境异常：**C 盘 0 字节可用**（PROGRESS 旧记录 ~7G），MSYS 管道与临时文件持续报
+     No space left —— 本轮起所有临时输出走 G:\tmp（每次 Bash 调用前置 TMPDIR/TEMP=/g/tmp）。
+     另注意 benchmark 的 CSV 写在 **cwd 根目录**（fopen 相对路径），从 build\bench_results.csv
+     拷会拿到 run_bench.bat 的旧产物（本轮差点把同一文件当两轮落库，cmp 抓出）。
+- [ ] 下一步（r59 后候选）：**无未关闭的优化候选**（①②已定案关闭，r52 遗留三项全清；hist
+      「不再开 spike」判定维持）。转周期性健康巡检：smoke + 两轮 bench 确认无回退即收尾；
+      除非用户提出新需求，不自行启动新 spike。
+- 同步状态（2026-11-16 r59 现场核实）：本轮 1 个 commit（巡检 r59 + 候选①关闭 + 两轮 CSV +
+  probe_int9 分尺寸地板记录）。`bash scripts/push.sh` 执行结果在 commit 后回填（见日报）。
+  本地分支仍只有 `main` + 两个
   已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
   （以上为本轮现场核实，非照抄。）
-- 上一轮同步状态（2026-11-14 r57，历史）：commit `7cf63e5`，SYNC_OK 7cf63e5；
-  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致、`git status` 干净。
+- 上一轮同步状态（2026-11-15 r58，历史）：commit `a188f4e` + `70e5465`，SYNC_OK 70e5465
+  （第一次尝试 TLS 中断 SYNC_FAIL，重试成功）；`git ls-remote --heads origin main` 与
+  `git rev-parse HEAD` 核对一致（70e5465）、`git status` 干净。
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
