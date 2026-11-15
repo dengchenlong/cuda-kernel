@@ -378,9 +378,10 @@ G:\cuda-kernel
 - [ ] 下一步（r59 后候选）：**无未关闭的优化候选**（①②已定案关闭，r52 遗留三项全清；hist
       「不再开 spike」判定维持）。转周期性健康巡检：smoke + 两轮 bench 确认无回退即收尾；
       除非用户提出新需求，不自行启动新 spike。
-- 同步状态（2026-11-16 r59 现场核实）：本轮 1 个 commit（巡检 r59 + 候选①关闭 + 两轮 CSV +
-  probe_int9 分尺寸地板记录）。`bash scripts/push.sh` 执行结果在 commit 后回填（见日报）。
-  本地分支仍只有 `main` + 两个
+- 同步状态（2026-11-16 r59 现场核实）：本轮 1 个 commit `d2307e4`（巡检 r59 + 候选①关闭 +
+  两轮 CSV + probe_int9 分尺寸地板记录）。`bash scripts/push.sh` 亲眼看到 **SYNC_OK d2307e4**；
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致（d2307e4）、`git status`
+  干净。本地分支仍只有 `main` + 两个
   已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
   （以上为本轮现场核实，非照抄。）
 - 上一轮同步状态（2026-11-15 r58，历史）：commit `a188f4e` + `70e5465`，SYNC_OK 70e5465
