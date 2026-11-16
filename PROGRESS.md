@@ -375,7 +375,15 @@ G:\cuda-kernel
      No space left —— 本轮起所有临时输出走 G:\tmp（每次 Bash 调用前置 TMPDIR/TEMP=/g/tmp）。
      另注意 benchmark 的 CSV 写在 **cwd 根目录**（fopen 相对路径），从 build\bench_results.csv
      拷会拿到 run_bench.bat 的旧产物（本轮差点把同一文件当两轮落库，cmp 抓出）。
-- [ ] 下一步（r59 后候选）：**无未关闭的优化候选**（①②已定案关闭，r52 遗留三项全清；hist
+- [x] 下一步（2026-11-16 r59 后 → 2026-11-17 r60 完成）：周期性健康巡检 r60（无代码改动，二进制=r58）。
+  1) smoke 全绿（all pass，0 flagged，120 [OK]）。
+  2) bench 两轮均 **120/120 WIN 零 lose**：r60a min 1.473 / p10 2.608 / 中位 9.327 / max 45.365；
+     r60b min 1.233 / p10 2.522 / 中位 9.538 / max 45.978。无任何 lose 项，hist 家族本轮零摆动。
+     CSV 落 docs/bench/bench_sm61_r60a.csv / bench_sm61_r60b.csv。
+  3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
+     每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
+  4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
+- [ ] 下一步（r60 后候选）：**无未关闭的优化候选**（①②已定案关闭，r52 遗留三项全清；hist
       「不再开 spike」判定维持）。转周期性健康巡检：smoke + 两轮 bench 确认无回退即收尾；
       除非用户提出新需求，不自行启动新 spike。
 - 同步状态（2026-11-16 r59 现场核实）：本轮 1 个 commit `d2307e4`（巡检 r59 + 候选①关闭 +
