@@ -383,15 +383,13 @@ G:\cuda-kernel
   3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
      每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
   4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
-- [ ] 下一步（r60 后候选）：**无未关闭的优化候选**（①②已定案关闭，r52 遗留三项全清；hist
-      「不再开 spike」判定维持）。转周期性健康巡检：smoke + 两轮 bench 确认无回退即收尾；
-      除非用户提出新需求，不自行启动新 spike。
-- 同步状态（2026-11-16 r59 现场核实）：本轮 1 个 commit `d2307e4`（巡检 r59 + 候选①关闭 +
-  两轮 CSV + probe_int9 分尺寸地板记录）。`bash scripts/push.sh` 亲眼看到 **SYNC_OK d2307e4**；
-  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致（d2307e4）、`git status`
-  干净。本地分支仍只有 `main` + 两个
-  已合入 main 的 `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
-  （以上为本轮现场核实，非照抄。）
+- 同步状态（2026-11-17 r60 现场核实）：本轮 1 个 commit `e703e28`（巡检 r60 + 两轮 CSV +
+  CSV 覆盖写注意记录）。`bash scripts/push.sh` 亲眼看到 **SYNC_OK e703e28**（第 1 次尝试成功）；
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致（e703e28）、`git status`
+  干净。本地分支仍只有 `main` + 两个已合入 main 的 `spike-hist4k` / `spike-clock-lock`
+  （非遗留问题，勿再列为待办）。（以上为本轮现场核实，非照抄。）
+- 上一轮同步状态（2026-11-16 r59，历史）：本轮 1 个 commit `d2307e4`（巡检 r59 + 候选①关闭 +
+  两轮 CSV + probe_int9 分尺寸地板记录）。
 - 上一轮同步状态（2026-11-15 r58，历史）：commit `a188f4e` + `70e5465`，SYNC_OK 70e5465
   （第一次尝试 TLS 中断 SYNC_FAIL，重试成功）；`git ls-remote --heads origin main` 与
   `git rev-parse HEAD` 核对一致（70e5465）、`git status` 干净。
