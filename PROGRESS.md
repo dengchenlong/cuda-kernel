@@ -375,6 +375,16 @@ G:\cuda-kernel
      No space left —— 本轮起所有临时输出走 G:\tmp（每次 Bash 调用前置 TMPDIR/TEMP=/g/tmp）。
      另注意 benchmark 的 CSV 写在 **cwd 根目录**（fopen 相对路径），从 build\bench_results.csv
      拷会拿到 run_bench.bat 的旧产物（本轮差点把同一文件当两轮落库，cmp 抓出）。
+- [x] 下一步（2026-11-17 r60 后 → 2026-11-19 r61 完成）：周期性健康巡检 r61（无代码改动，二进制=r58）。
+  1) smoke 全绿（all pass，0 flagged，120 [OK]）。
+  2) bench 两轮均 **120/120 WIN 零 lose**：r61a min 1.440 / p10 2.621 / 中位 9.627 / max 46.922；
+     r61b 同值（见下）。最低项 hist-gray 4K 1.440，hist 家族零摆动。
+     CSV 落 docs/bench/bench_sm61_r61a.csv / bench_sm61_r61b.csv（各自跑完立即另存，未发生覆盖）。
+  3) **新认知（r61 三轮验证）**：连续三轮 bench 的 mine_ms **120 项逐位完全相同**（r61a=r61b=r61c，
+     r61c 存 G:\tmp\bench_r61c.csv 备查），而 opencv_ms 列逐轮微差（integral 640 的 OpenCV
+     0.6697→0.6748）。即 250 次取中位后**我方内核计时在本机是确定的**，偶发 lose 只可能来自
+     OpenCV 侧抖动——此前把 hist 家族临界 lose 归因「双方噪声」可以收紧为「主要是对手侧噪声」。
+  4) 开工时检查过无残留 bench 进程（r53 教训）；C 盘本轮未写任何文件，临时输出走 G:\tmp。
 - [x] 下一步（2026-11-16 r59 后 → 2026-11-17 r60 完成）：周期性健康巡检 r60（无代码改动，二进制=r58）。
   1) smoke 全绿（all pass，0 flagged，120 [OK]）。
   2) bench 两轮均 **120/120 WIN 零 lose**：r60a min 1.473 / p10 2.608 / 中位 9.327 / max 45.365；
