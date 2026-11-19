@@ -640,6 +640,79 @@ namespace {
 struct MinOpF { __device__ float operator()(float a, float b) const { return fminf(a, b); } static __device__ float ident() { return __int_as_float(0x7f800000); } };
 struct MaxOpF { __device__ float operator()(float a, float b) const { return fmaxf(a, b); } static __device__ float ident() { return __int_as_float(0xff800000); } };
 
+// ---------------- f32 k=3 单遍融合（2026-11-20，r62）----------------
+// 病灶同 r45 的 mean-f32 k=3：两遍分离 16B/px（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4），
+// 4K 1.90ms = 73 GB/s，纯 float4 拷贝天花板 ~93 GB/s ⇒ 唯一空间是砍流量到 8B/px。
+// 结构照抄 mean32_fuse3_kernel：4 px/线程（float4），寄存器滚动 3 行水平 3-tap 结果，
+// 水平 halo 用 __shfl_up/down 取邻线程的 float4 分量，只有 lane 0/31 与图像左右边界落 global。
+// 与 mean 的关键差别：min/max 的边界语义是「窗口 clamp 到图内」（= 恒等元 +inf/-inf），
+// 所以 halo 取图像边缘像素本身即可，**不需要** mean 那套 REFLECT_101 镜像。
+// 约束：out-of-place、W%4==0、8<=W<=4096、16B 对齐；其余回退两遍路径。
+template <typename Op, int TH>
+__global__ void morph32_fuse3_kernel(const float* __restrict__ src, size_t sstep,
+                                     float* __restrict__ dst, size_t dstep,
+                                     int W, int H)
+{
+    const int tid  = threadIdx.x;
+    const int x0   = (blockIdx.x * blockDim.x + tid) * 4;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (x0 < W);
+    // 非活跃线程仍要参与 shuffle，给一个 16B 对齐的安全取数地址（同 mean32_fuse3_kernel）
+    const int xa   = act ? x0 : ((W - 4) & ~3);
+    const int rows = (int)(sstep >> 2), orows = (int)(dstep >> 2);
+    const Op op;
+
+    // 一行内的水平 3 邻域 min/max（clamp 边界 = 取边缘像素本身）
+    auto hrow = [&](int ry, float o[4]) {
+        const float* srow = src + (size_t)ry * rows;
+        const float4 v = *(const float4*)(srow + xa);
+        float l1 = __shfl_up_sync(0xffffffffu, v.w, 1);
+        float r1 = __shfl_down_sync(0xffffffffu, v.x, 1);
+        if (lane == 0 || xa == 0)      l1 = (xa == 0) ? v.x : srow[xa - 1];
+        if (lane == 31 || xa + 4 >= W) r1 = (xa + 4 >= W) ? v.w : srow[xa + 4];
+        o[0] = op(v.x, op(l1, v.y));
+        o[1] = op(v.y, op(v.x, v.z));
+        o[2] = op(v.z, op(v.y, v.w));
+        o[3] = op(v.w, op(v.z, r1));
+    };
+
+    float hp[4], hc[4], hn[4];
+    hrow(max(0, y0 - 1), hp);
+    hrow(y0, hc);
+    for (int y = y0; y < y1; ++y) {
+        hrow(min(H - 1, y + 1), hn);
+        if (act) {
+            float4 o;
+            o.x = op(hp[0], op(hc[0], hn[0]));
+            o.y = op(hp[1], op(hc[1], hn[1]));
+            o.z = op(hp[2], op(hc[2], hn[2]));
+            o.w = op(hp[3], op(hc[3], hn[3]));
+            *(float4*)(dst + (size_t)y * orows + x0) = o;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { hp[i] = hc[i]; hc[i] = hn[i]; }
+    }
+}
+
+template <typename Op>
+void morph32_fuse3(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
+                   int width, int height, cudaStream_t stream)
+{
+    const int TH = (height >= 1600) ? 64 : (height > 800 ? 32 : (height > 400 ? 16 : 8));
+    int th = ((width + 3) / 4 + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    dim3 g((width + 4 * th - 1) / (4 * th), (height + TH - 1) / TH);
+    switch (TH) {
+    case 8:  morph32_fuse3_kernel<Op, 8> <<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 16: morph32_fuse3_kernel<Op, 16><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 32: morph32_fuse3_kernel<Op, 32><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    default: morph32_fuse3_kernel<Op, 64><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    }
+}
+
 template <typename Op>
 __global__ void morph32_rows_kernel(const float* __restrict__ src, size_t sstep,
                                     float* __restrict__ dst, size_t dstep,
@@ -893,6 +966,18 @@ template <typename Op>
 void morph32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
              int width, int height, int kw, int kh, cudaStream_t stream)
 {
+    // r62：k=3 单遍融合（8B/px，原两遍 16B/px）。原地（src==dst）不走 —— 融合内核
+    // 靠 block 间读 src 的未覆盖行，原地会跨 block 竞态；benchmark 的 f32 形态学是
+    // out-of-place 口径（dGrayF → dMineF），原地仍回退两遍路径（安全、逐位一致）。
+    const bool inplace32 = ((const void*)d_src == (const void*)d_dst);
+    const bool fuse32 = (kw == 3 && kh == 3 && !inplace32 && width >= 8 && width <= 4096 &&
+                         (width % 4 == 0) && (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                         ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+    if (fuse32) {
+        morph32_fuse3<Op>(d_src, srcStep, d_dst, dstStep, width, height, stream);
+        return;
+    }
+
     // 关键：列遍必须读「行遍的输出」而不是 dst 原地读写 —— 行分块后，上方 chunk 的
     // 输出行会被下方 chunk 当输入读，block 间无同步 → 竞态（u8 版列遍读 tmp 同理）
     const size_t tstep = (size_t)width * 4;
