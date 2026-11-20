@@ -471,7 +471,15 @@ G:\cuda-kernel
   3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
      每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
   4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
-- 同步状态（2026-11-20 r62 现场核实）：本轮 3 个 commit —— `07cefcf`（morph-f32 k=3 单遍融合 +
+- 同步状态（2026-11-21 r63 现场核实）：本轮 2 个 commit —— `cc6d5e1`（gaussian-f32 k=15
+  单遍融合 + 四个探针 + 三轮 CSV）+ `bfb2c80`（BENCHMARK 第二十七轮 + PROGRESS 更新）。
+  `bash scripts/push.sh` 亲眼看到 **SYNC_OK cc6d5e1**、**SYNC_OK bfb2c80**（cc6d5e1 首次
+  走 7897 代理三次 TLS 全败，清除失效的仓库级 `http.proxy` 后直连成功；bfb2c80 那次
+  push.sh 自己探测到 7897 仍可用并成功 —— 该端口状态在抖动，不可长期依赖）。
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致（均 bfb2c80）、
+  `git status` 干净。本地分支仍只有 `main` + 两个已合入 main 的 `spike-hist4k` /
+  `spike-clock-lock`（非遗留问题，勿再列为待办）。（以上为本轮现场核实，非照抄。）
+- 上一轮同步状态（2026-11-20 r62，历史）：本轮 3 个 commit —— `07cefcf`（morph-f32 k=3 单遍融合 +
   BENCHMARK 第二十六轮 + probe_mf32k3 + 两轮 CSV）+ `2dc9e0b` + `8c5a75f`（同步状态行与其修正）。
   `bash scripts/push.sh` 亲眼看到 **SYNC_OK 07cefcf** / **SYNC_OK 2dc9e0b** / **SYNC_OK 8c5a75f**
   （均第 1 次尝试成功）；`git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致
