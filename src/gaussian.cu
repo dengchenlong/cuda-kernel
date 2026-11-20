@@ -1352,6 +1352,109 @@ __global__ void gauss32_fuse_kernel(const float* __restrict__ src, size_t sstep,
     }
 }
 
+// ---------------- f32 k=15 单遍融合（2026-11-21 r63）----------------
+// 病灶：k=15 没有融合路径，一直走 v4 两遍（流量 16B/px + 每像素 30 次 smem 读），
+// 4K 1.72ms 折算 8B/px 口径只有 ~50 GB/s 的有用带宽（拷贝天花板 93）。
+// 定案（probe_gf32k15b/c/d 四轮探针）：把 k=5 融合内核的 halo 从 |2| 推广到 |7|
+// （shfl_up/down delta 1/2，warp 边界落 global 镜像），并加**跨迭代软件预取**（先发下一行
+// float4 load 再算当前行）—— 每迭代 15 级 fmaf 依赖链靠预取填延迟。
+//   · 寄存器 128 → 2 块/SM；预取 + TH=192 + th=128 + launch_bounds(256,2) 是甜点：
+//     4K 1.0554 vs 1.7172（1.63x）、1080p 1.54x、720p 1.17x；640x480 输（0.54x）→ 按尺寸分档。
+//   · 640x480 走 TH=128/th=64（探针 d 的 s192t64/c128 档里最快的组合），小图并行度是唯一抓手。
+// 算术次序与两遍路径完全同序（fmaf 链 c_w[0..14] 从 0.f 起）→ 与旧路径逐位一致。
+// 约束同 k=5：out-of-place、W%4==0、8<=W<=4096、16B 对齐；其余回退 v4 两遍。
+template <int K, int TH, int LBM, int LBPB>
+__global__ void __launch_bounds__(LBM, LBPB)
+gauss32_fuse15_kernel(const float* __restrict__ src, size_t sstep,
+                      float* __restrict__ dst, size_t dstep, int W, int H)
+{
+    constexpr int HALF = K / 2;
+    const int tid  = threadIdx.x;
+    const int x0   = (blockIdx.x * blockDim.x + tid) * 4;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (x0 < W);
+    const int xa   = act ? x0 : ((W - 4) & ~3);   // 非活跃线程给安全地址，仍参与 shuffle
+    const int rows = (int)(sstep >> 2), orows = (int)(dstep >> 2);
+
+    float h[K][4];
+
+    auto hrow = [&](int ry, float4 v, float o[4]) {
+        const float* srow = src + (size_t)ry * rows;
+        float L[HALF], Rt[HALF];
+#pragma unroll
+        for (int j = 1; j <= HALF; ++j) {
+            const int d = (j - 1) / 4 + 1;
+            const int c = (j - 1) % 4;
+            float lv, rv;
+            if (c == 0)      { lv = __shfl_up_sync(0xffffffffu, v.w, d);  rv = __shfl_down_sync(0xffffffffu, v.x, d); }
+            else if (c == 1) { lv = __shfl_up_sync(0xffffffffu, v.z, d);  rv = __shfl_down_sync(0xffffffffu, v.y, d); }
+            else if (c == 2) { lv = __shfl_up_sync(0xffffffffu, v.y, d);  rv = __shfl_down_sync(0xffffffffu, v.z, d); }
+            else             { lv = __shfl_up_sync(0xffffffffu, v.x, d);  rv = __shfl_down_sync(0xffffffffu, v.w, d); }
+            L[j - 1]  = lv;
+            Rt[j - 1] = rv;
+        }
+        if (lane < 2 || xa < HALF) {
+#pragma unroll
+            for (int j = 1; j <= HALF; ++j) L[j - 1] = srow[g32f_mirror(xa - j, W)];
+        }
+        if (lane > 29 || xa + 4 + HALF > W) {
+#pragma unroll
+            for (int j = 1; j <= HALF; ++j) Rt[j - 1] = srow[g32f_mirror(xa + 3 + j, W)];
+        }
+        float pb[4 + 2 * HALF];
+#pragma unroll
+        for (int j = 0; j < HALF; ++j) pb[j] = L[HALF - 1 - j];
+        pb[HALF + 0] = v.x; pb[HALF + 1] = v.y; pb[HALF + 2] = v.z; pb[HALF + 3] = v.w;
+#pragma unroll
+        for (int j = 0; j < HALF; ++j) pb[HALF + 4 + j] = Rt[j];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float s = 0.f;
+#pragma unroll
+            for (int q = 0; q < K; ++q) s = fmaf(c_w[q], pb[i + q], s);
+            o[i] = s;
+        }
+    };
+    auto ld = [&](int ry) {
+        return *(const float4*)(src + (size_t)ry * rows + xa);
+    };
+
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int ry = g32f_mirror(y0 - HALF + i, H);
+        hrow(ry, ld(ry), h[i]);
+    }
+
+    int rcur = g32f_mirror(y0 + HALF + 1, H);       // 首迭代要算的行（h 已含到 y0+HALF）
+    float4 vcur = ld(rcur);
+    for (int y = y0; y < y1; ++y) {
+        const int rnext = g32f_mirror(y + HALF + 2, H);   // 下一迭代 y+1 要算的行，提前发
+        const float4 vnext = ld(rnext);
+        float hn[4];
+        hrow(rcur, vcur, hn);
+        if (act) {
+            float vv[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float s = 0.f;
+#pragma unroll
+                for (int q = 0; q < K; ++q) s = fmaf(c_w[q], h[q][j], s);
+                vv[j] = s;
+            }
+            *(float4*)(dst + (size_t)y * orows + x0) = make_float4(vv[0], vv[1], vv[2], vv[3]);
+        }
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) h[i][j] = h[i + 1][j];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) h[K - 1][j] = hn[j];
+        vcur = vnext; rcur = rnext;
+    }
+}
+
 } // namespace
 
 void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstStep,
@@ -1363,9 +1466,10 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
 
     // k=5 单遍融合（2026-11-02）：两遍 16B/px → 8B/px。
     const bool inplace32 = ((const void*)d_src == (const void*)d_dst);
-    const bool fuse32 = (ksize == 5 && !inplace32 && width >= 8 && width <= 4096 &&
+    const bool fuseOk = (!inplace32 && width >= 8 && width <= 4096 &&
                          (width % 4 == 0) && (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
                          ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+    const bool fuse32 = (ksize == 5 && fuseOk);
     if (fuse32) {
         // TH 分档（2026-11-15 r58，probe_gf32th 三轮 7 档 × 4 尺寸扫描，排序逐轮一致、
         // 逐 TH 正确性全 0）：640→16（-14%）、720p→64（-9%）、1080p→96（-5%）、4K→128（-2%）。
@@ -1386,8 +1490,18 @@ void gpu_gaussian_f32(const float* d_src, size_t srcStep, float* d_dst, size_t d
         }
         return;
     }
-
-    // v4 路径（spike 002）
+    if (ksize == 15 && fuseOk && (size_t)width * height >= 500000) {
+        // TH/th 分档（2026-11-21 r63，probe_gf32k15d 交错 min）：
+        //   720p/1080p/4K 全部 TH192/th128（4K 1.0554 vs 两遍 1.7172 = 1.63x）。
+        //   128 regs + launch_bounds(256,2) → 2 块/SM；th=128 时 W≤4096 是 1~2 块/行。
+        //   **小图（<500K px）不走融合**：640x480 融合最快 0.138ms，反而不如两遍 0.091ms ——
+        //   15-tap 的垂直依赖链要靠「每块扫 192 行」摊薄，行数少时启动/填充占比过大。
+        const int th = 128;
+        const int TH = 192;
+        dim3 g(idiv_up(width, 4 * th), idiv_up(height, TH));
+        gauss32_fuse15_kernel<15, 192, 256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height);
+        return;
+    }
     const size_t fstep = (size_t)width * 4;
     float* tmp = (float*)ws_grow(fstep * height + 1024);
     {
