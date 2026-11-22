@@ -122,6 +122,84 @@ __global__ void mean_cols_blocked_kernel(const uint16_t* __restrict__ tmp, size_
     }
 }
 
+// ---------------- 大核行遍重写（2026-11-24 r64）----------------
+// 归因（docs/probes/probe_meanbig.cu asym，交错 min，四尺寸）：
+//   4K    (1,1) 1.506 | (31,1) 4.893（行遍 +3.39）| (1,31) 1.861（列遍 +0.36）| (31,31) 4.461
+//   1080p (1,1) 0.482 | (31,1) 1.619（行遍 +1.14）| (1,31) 0.819（列遍 +0.34）
+//   ⇒ 行遍是唯一大头；列遍增量已贴同尺寸搬运地板（u16->u8 @4K 0.261ms）。
+// 病灶：旧 mean_rows_kernel 的 k>15 分支每 block 只做**一行的一个 256 列段**，且用 512 元
+//   Hillis-Steele smem 扫描 = 9 轮 × 2 次 __syncthreads = 18 次屏障；4K 有 32400 个块。
+//   4K 行遍增量 3.39ms / 3N(24.9MB) = 7.3 GB/s，u8->u16 搬运地板是 94.6 GB/s ⇒ 13 倍差距。
+// 定案 mean_rows_slide_kernel<C>（probe_mr31 check 42 用例 vs CPU int64 精确窗口和，逐值全 0）：
+//   ① **一行一 block**（4K 2160 块）→ 每 block 只 1 次 __syncthreads（18 → 1）；
+//   ② 整段 [x0-half, x0+bw+half) 一次搬进 smem，REFLECT_101 在载入时解决；
+//   ③ 每线程 C=16 个连续像素，初始窗口 O(k) 直加一次，之后每像素「+新 -旧」滑动 O(1)；
+//   ④ **写回必须 16B 向量化**：16 个 u16 标量存时 lane 相隔 32B，一条 store 的 32 lane
+//      落在 32 个 sector、每个只写 2/32 字节（16 倍写放大）—— 与 r50 integral pass1 同源的坑。
+//      打包成 uint4 后 4K k=31 行遍 1.13 → 0.48ms（v1 → v3，2.33x）。
+// 实测（probe_mr31 ab，纯内核）：4K k=31 3.54→0.48（7.36x）、1080p 1.00→0.143（6.99x）、
+//   720p 0.499→0.073、640 0.180→0.036；k=15 同档 2.5~2.8x。输出与旧内核逐位一致。
+template <int C>
+__global__ void mean_rows_slide_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                                       uint16_t* __restrict__ tmp, size_t tstep, int W, int k)
+{
+    extern __shared__ uint8_t sm[];
+    const int half = k >> 1;
+    const int y    = blockIdx.x;
+    const int bw   = blockDim.x * C;
+    const int x0   = blockIdx.y * bw;
+    const int tid  = threadIdx.x;
+    const int nld  = min(bw, W - x0) + 2 * half;
+    const uint8_t* srow = src + (size_t)y * sstep;
+
+    for (int i = tid; i < nld; i += blockDim.x)
+        sm[i] = srow[mirror101<true>(x0 - half + i, W)];
+    __syncthreads();
+
+    const int gx = x0 + tid * C;
+    if (gx >= W) return;
+    const int li = tid * C;
+    const int n  = min(C, W - gx);
+    uint16_t* trow = tmp + (size_t)y * (tstep >> 1);
+
+    uint32_t s = 0;
+#pragma unroll 4
+    for (int j = 0; j < k; ++j) s += sm[li + j];
+
+    uint16_t p[C];
+    for (int i = 0; i < n; ++i) {
+        p[i] = (uint16_t)s;
+        if (i + 1 < n) s += (uint32_t)sm[li + i + k] - (uint32_t)sm[li + i];
+    }
+    if (n == C && ((tstep & 15) == 0)) {
+        uint4* q = (uint4*)(trow + gx);          // gx = tid*C，C=16 ⇒ 16B 对齐
+#pragma unroll
+        for (int i = 0; i < C / 8; ++i)
+            q[i] = make_uint4(p[8*i] | ((uint32_t)p[8*i+1] << 16),
+                              p[8*i+2] | ((uint32_t)p[8*i+3] << 16),
+                              p[8*i+4] | ((uint32_t)p[8*i+5] << 16),
+                              p[8*i+6] | ((uint32_t)p[8*i+7] << 16));
+    } else {
+        for (int i = 0; i < n; ++i) trow[gx + i] = p[i];
+    }
+}
+
+// 大核行遍分派：一行一 block，th 按 W 选（每线程 16 像素）
+void mean_rows_slide(const uint8_t* d_src, size_t srcStep, uint16_t* tmp, size_t tstep,
+                     int width, int height, int k, cudaStream_t stream)
+{
+    constexpr int C = 16;
+    int th = (width + C - 1) / C;
+    th = (th + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    const int bw  = th * C;
+    const int nbx = (width + bw - 1) / bw;
+    const size_t smem = (size_t)(bw + 2 * (k / 2));
+    dim3 g(height, nbx);
+    mean_rows_slide_kernel<C><<<g, th, smem, stream>>>(d_src, srcStep, tmp, tstep, width, k);
+}
+
 // ---------------- k=3 单遍融合（2026-10-27） ----------------
 // 旧 mean3_direct_kernel 是 32x8 smem tile：每像素 9 次 smem 字节读、32400 个小 block，
 // 4K 1.10ms 只有 7.5 GB/s；更要命的是它的 tile halo 从 global 读，原地调用（benchmark 口径）
@@ -321,8 +399,15 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
     const size_t tstep = (size_t)width * 2;
     uint16_t* tmp = (uint16_t*)ws_grow(tstep * height + 1024);
 
-    dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
-    mean_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+    if (kw >= 15 && kw <= 33) {
+        // 大核行遍（2026-11-24 r64）：一行一 block + 每线程 16 像素滑动，见 mean_rows_slide 注释。
+        // 门槛 k>=15 的由来：probe_mr31 ab 里 k=15 与 k=31 都测到 2.5~7.4x（k=15 的旧路径虽走
+        // O(k) 直加，但 18 次屏障的结构开销与块数问题一样存在）；k<15 未测，保持旧路径。
+        mean_rows_slide(d_src, srcStep, tmp, tstep, width, height, kw, stream);
+    } else {
+        dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
+        mean_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+    }
 
     if (kw <= 15 && kh <= 15) {
         // 小核列遍走行分块（全场 W*ceil(H/rpt) 线程）；4K 实测 rpt=64 最优，小图 rpt=16 更好
