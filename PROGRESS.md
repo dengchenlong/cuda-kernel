@@ -605,6 +605,16 @@ G:\cuda-kernel
   `bash scripts/push.sh` 亲眼看到 **SYNC_OK ee6c927**（第 1 次尝试成功，proxy=直连）。
   `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致
   （均 ee6c92797ed0533aa4d7aa5931717eb680d6ef4a）、`git status` 干净。
+  **推送过程（新坑，记录备查）**：第 1 个 commit `ee6c927` 的 push 一次成功；第 2 个
+  commit `fcf05d1`（纯文档）的 push **连续 3 次直连超时 SYNC_FAIL**（21s 超时 ×3，
+  curl 直连与 7897 代理均返回 000），但 `nslookup github.com` 在
+  **57.155.223.240 / 20.205.243.166 / 20.247.166.64** 之间跳动（前者是污染地址），
+  `--resolve github.com:443:20.27.177.113` 稳定 200。等约 3 分钟后直连自行恢复，
+  重跑 push.sh 一次成功。**结论：本轮是链路抖动，不是仓库配置问题**（`http.proxy` 未设置、
+  `gh auth` 正常）；下次再遇 TLS/超时要先用 `curl --max-time 6 https://github.com/`
+  测当前直连状态，别急着改配置。另注意 `git -c http.curloptResolve=...` 在本机
+  **不可用**（git 的 SSL 后端是 schannel，报 "Unsupported SSL backend 'openssl'"），
+  想绕过 DNS 污染只能改 hosts 或换 SSH。
   `git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
   `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。（以上为本轮现场核实，非照抄。）
 - 上一轮同步状态（2026-11-24 r64，历史）：本轮 1 个 commit —— `75c0fed`（mean 大核行遍重写 +
