@@ -200,6 +200,141 @@ void mean_rows_slide(const uint8_t* d_src, size_t srcStep, uint16_t* tmp, size_t
     mean_rows_slide_kernel<C><<<g, th, smem, stream>>>(d_src, srcStep, tmp, tstep, width, k);
 }
 
+// ---------------- 大核列遍重写（2026-11-24 r65）----------------
+// 归因（probe_mcol2/mcol3 sweep，交错 min，四尺寸；u16->u8 地板 640 52.9 / 720p 75.0 /
+//   1080p 84.4 / 4K 95.7 GB/s）：
+//   4K k=15 old_blocked 3.11ms(8.0 GB/s) | old_slide 0.92(27.0) | 新 0.325(76.7)
+//   4K k=31 old_blocked 6.20(4.0)        | old_slide 0.93(26.6) | 新 0.373(66.8)
+//   ⇒ 两个旧内核各有硬伤，新内核把两者一起替掉：
+//     ① mean_cols_blocked_kernel 每输出行 O(k) 直加 ⇒ k=15 时 tmp 重读 15 倍（45B/px）；
+//     ② mean_cols_kernel 每线程一列沿 y 走 ⇒ 4K 只有 W=3840 线程（6 SM 上 30 warp），
+//        并行度严重不足，折 27 GB/s。
+// 定案 mean_cols_vec_kernel<C=4>：**每线程 C 个连续列 + 行分块 rpt + 窗口滑动**。
+//   关键认识（PROGRESS 要求先量清的「列方向 16 行不连续」问题）：**这根本不是问题**——
+//   一行之内的 C 个列在内存里是连续的，问题只出在「一列 C 个连续行」那种拆法上。
+//   本内核沿 y 分块、块内逐行推进，同一 warp 的 32 个 lane 在同一行上覆盖 32*4 = 128 个
+//   连续列 ⇒ 读 256B / 写 128B 都是整段合并，与行遍的 16B 甜点结构同源。
+//   **不要**改成「一列 C 行」（那才是 16 倍 sector 放大的坑，r50 integral pass1 同源）。
+// 初始窗口 O(k) 直加一次被 rpt 行摊薄；之后每行「+新 −旧」O(1)。
+// 为什么**不做**寄存器 ring（每行只读一次，流量 3B/px 而非 5B/px）：
+//   probe_mcol3 实测 ring 在 k=31 反而慢 —— v[31][4] = 124 个寄存器溢出，4K 0.373→0.87+；
+//   k=15 的 ringC4 也只与 vecC4 打平（4K 0.3256 vs 0.3246）。第二次读的是 half 行之前
+//   访问过的同一物理行，已被 L1/L2 吸收，实测不构成代价。**ring 路线已否决，勿重开。**
+// rpt 扫参（probe_mcol3 rpt，9 档 × 3 轮轮转交错 min，排序稳定）：
+//   k=15 → rpt=8 全尺寸最优（4K 0.3246 / 1080p 0.0979 / 720p 0.0594 / 640 +6% 于最优）；
+//   k=31 → rpt=12 全尺寸最优（4K 0.3727 / 1080p 0.1126 / 720p 0.0635 / 640 最优）。
+//   ⇒ 一条规则 `rpt = (k <= 15) ? 8 : 12`，不做分尺寸档（避免 r49 那种噪声拟合）。
+// 验证：probe_mcol2 check 132 用例 + probe_mcol3 check 48 用例，新/旧/CPU int64 三方逐值全 0
+//   （含 16x1/16x2/17x3/8x1/1x1/1x7/12x5 极扁、4096x64、1281x721 非 4 倍数宽、四档 bench 尺寸）。
+// 约束：width % 4 == 0 且 dst 4B 对齐（其余回退旧路径，结果一致）。
+template <int C>
+__device__ __forceinline__ void mcol_ld4(const uint16_t* __restrict__ p, uint32_t v[C])
+{
+    const uint2 w = *(const uint2*)p;      // C=4：8B = 4 个 u16
+    v[0] = w.x & 0xffffu; v[1] = w.x >> 16;
+    v[2] = w.y & 0xffffu; v[3] = w.y >> 16;
+}
+
+__device__ __forceinline__ uint mcol_pack4(uint32_t a, uint32_t b, uint32_t c, uint32_t d, float inv)
+{
+    uint w = 0;
+    const uint32_t s[4] = {a, b, c, d};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        int q = __float2int_rn((float)s[j] * inv);
+        q = max(0, min(255, q));
+        w |= ((uint32_t)q) << (8 * j);
+    }
+    return w;
+}
+
+template <int C>
+__global__ void mean_cols_vec_kernel(const uint16_t* __restrict__ tmp, size_t tstep,
+                                     uint8_t* __restrict__ dst, size_t dstep,
+                                     int W, int H, int kh, float inv_area, int rpt)
+{
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * C;
+    if (c >= W) return;
+    const int y0 = blockIdx.y * rpt;
+    if (y0 >= H) return;
+    const int y1 = min(H, y0 + rpt);
+    const int half = kh >> 1;
+    const size_t trows = tstep >> 1;
+
+    if (c + C > W) {                       // 尾列（W%4!=0 时不会进本内核，这里只是兜底）
+        for (int y = y0; y < y1; ++y) {
+            for (int i = c; i < W; ++i) {
+                uint32_t s = 0;
+                for (int j = -half; j <= half; ++j)
+                    s += tmp[(size_t)mirror101<false>(y + j, H) * trows + i];
+                const int v = __float2int_rn((float)s * inv_area);
+                dst[(size_t)y * dstep + i] = (uint8_t)max(0, min(255, v));
+            }
+        }
+        return;
+    }
+
+    uint32_t acc[C];
+#pragma unroll
+    for (int i = 0; i < C; ++i) acc[i] = 0;
+    {
+        uint32_t v[C];
+        for (int j = -half; j <= half; ++j) {
+            mcol_ld4<C>(tmp + (size_t)mirror101<false>(y0 + j, H) * trows + c, v);
+#pragma unroll
+            for (int i = 0; i < C; ++i) acc[i] += v[i];
+        }
+    }
+
+    for (int y = y0; y < y1; ++y) {
+        *(uint*)(dst + (size_t)y * dstep + c) =
+            mcol_pack4(acc[0], acc[1], acc[2], acc[3], inv_area);
+        if (y + 1 < y1) {
+            uint32_t vn[C], vo[C];
+            mcol_ld4<C>(tmp + (size_t)mirror101<false>(y + 1 + half, H) * trows + c, vn);
+            mcol_ld4<C>(tmp + (size_t)mirror101<false>(y - half, H) * trows + c, vo);
+#pragma unroll
+            for (int i = 0; i < C; ++i) acc[i] += vn[i] - vo[i];
+        }
+    }
+}
+
+// 列遍分派：对齐且 W%4==0、kh<=31 走 vec 版；其余回退旧内核（行为与 r64 完全一致）。
+// 为什么把 vec 卡在 kh<=31（probe_mcol3 bigk 实测）：kh>=33 时初始 O(k) 直加需要更大的 rpt
+// 才摊得平（k=255/4K 要 rpt=256 才 0.486ms，而 rpt=12 是 1.556ms > old_slide 1.053ms），
+// 且 k=33 的 4K 最优点在 r12 与 r32 之间来回跳（离群、不稳）。bench 只测 k=3/15/31，
+// 不为非 bench 路径引入未扫稳的 rpt 规则 —— kh>31 保留 old_slide（无回归）。
+void mean_cols_dispatch(const uint16_t* tmp, size_t tstep, uint8_t* d_dst, size_t dstStep,
+                        int width, int height, int kw, int kh, float inv_area,
+                        cudaStream_t stream)
+{
+    constexpr int C = 4;
+    const bool vec_ok = (width % 4 == 0) && width >= 4 && kh <= 31 &&
+                        (dstStep % 4 == 0) && ((uintptr_t)d_dst % 4 == 0);
+    if (vec_ok) {
+        const int rpt = (kh <= 15) ? 8 : 12;    // probe_mcol3 rpt 扫参：两档全尺寸最优
+        const int ng = width / C;
+        int th = (ng + 31) / 32 * 32;
+        if (th > MF_THREADS) th = MF_THREADS;
+        if (th < 32) th = 32;
+        dim3 g((ng + th - 1) / th, (height + rpt - 1) / rpt);
+        mean_cols_vec_kernel<C><<<g, th, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                     width, height, kh, inv_area, rpt);
+        return;
+    }
+    if (kw <= 15 && kh <= 15) {
+        // 小核列遍走行分块（全场 W*ceil(H/rpt) 线程）；4K 实测 rpt=64 最优，小图 rpt=16 更好
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2((width + MF_THREADS - 1) / MF_THREADS, (height + rpt - 1) / rpt), t2(MF_THREADS);
+        mean_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                        width, height, kh, inv_area, rpt);
+    } else {
+        // 大核：每列一线程滑动窗口 O(1)/像素（行分块会让每线程重复 O(k) 直加，不划算）
+        dim3 g2((width + MF_THREADS - 1) / MF_THREADS), t2(MF_THREADS);
+        mean_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
+    }
+}
+
 // ---------------- k=3 单遍融合（2026-10-27） ----------------
 // 旧 mean3_direct_kernel 是 32x8 smem tile：每像素 9 次 smem 字节读、32400 个小 block，
 // 4K 1.10ms 只有 7.5 GB/s；更要命的是它的 tile halo 从 global 读，原地调用（benchmark 口径）
@@ -409,17 +544,9 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
         mean_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
     }
 
-    if (kw <= 15 && kh <= 15) {
-        // 小核列遍走行分块（全场 W*ceil(H/rpt) 线程）；4K 实测 rpt=64 最优，小图 rpt=16 更好
-        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
-        dim3 g2(idiv_up(width, MF_THREADS), idiv_up(height, rpt)), t2(MF_THREADS);
-        mean_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
-                                                        width, height, kh, inv_area, rpt);
-    } else {
-        // 大核：每列一线程滑动窗口 O(1)/像素（行分块会让每线程重复 O(k) 直加，不划算）
-        dim3 g2(idiv_up(width, MF_THREADS)), t2(MF_THREADS);
-        mean_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
-    }
+    // 列遍（2026-11-24 r65 重写）：对齐且 W%4==0 走 vec 版（4 列/线程 + 行分块 + 滑动），
+    // 实测 4K k=15 3.11→0.325ms（9.6x）、k=31 6.20→0.373（16.6x）；否则回退旧路径。
+    mean_cols_dispatch(tmp, tstep, d_dst, dstStep, width, height, kw, kh, inv_area, stream);
 }
 
 // ================= CV_32F 输入均值滤波 =================
