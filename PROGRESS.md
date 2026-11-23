@@ -53,25 +53,90 @@ G:\cuda-kernel
 - 对比口径：都含 H2D 就绪后的纯 GPU 时间（cudaEvent 包住 kernel 或含拷贝分两栏报告，明确标注）
 
 ## 当前下一步（cron 续作从这里接）
-- **[待办 2026-11-24 r64 后] ① mean 列遍重写（家族最低项，证据齐全，直接开工）**：
-  r64 把行遍从 7.3 GB/s 拉到 ~50 GB/s 后，**列遍反超成为主因** —— 4K k=15 总 3.74ms
-  = 行遍 ~1.37 + 列遍 ~2.36；k=31 总 1.50ms = 行遍 0.48 + 列遍 ~1.02。两个病灶：
-  1) `mean_cols_kernel`（k>15 用）**每线程一列沿 y 走**，4K 只有 W=3840 线程 ⇒ 6 SM 上
-     并行度严重不足（探针 `probe_meanbig asym` 的 (1,31) 档给了净耗时：4K 0.36ms
-     增量 / 2N 读+1N 写 → 折算 41 GB/s，而 u16->u8 地板 95.3）；
-  2) `mean_cols_blocked_kernel`（k<=15 用）每输出行 O(k) 直加 ⇒ **15 倍 tmp 重读**。
-  建议直接套 r64 行遍的成功结构转置过来：**一条「列带」一个 block**（不是一列一 block），
-  带内整段 tmp 载入 smem，每线程负责 16 个**连续行**的同一列，上下来回各扫一遍做
-  滑动/双趟，输出攒寄存器后按「16 行 × 1 字节 = 16B」一次写 —— 注意列方向的向量写
-  要**跨行连续**（一列 16 行不连续！），所以要么改为「16 列 × 1 行」的块输出（即回到行方向），
-  要么接受 4B 粒度。**这一条要先写 probe 量清「列方向 16 行不连续」的写代价**，别直接改。
-- ② hist-gray 4K 1.23~1.46x 仍是全局最低项，但 r52 已判定为对手侧抖动、r61 三轮证明
+- **[待办 2026-11-24 r65 后] ① mean-f32 列遍重写（现在是 mean 家族唯一没重写的列遍，证据齐全）**：
+  r65 把 u8 列遍从 8~27 GB/s 拉到 66~77 GB/s（`mean_cols_vec_kernel<4>`），但 **f32 侧列遍
+  还是老路径** —— `mean32_cols_blocked_kernel`（k<=15，每输出行 O(k) 直加）/
+  `mean32_cols_kernel`（k>15，每线程一列沿 y 走）。r65b 实测 mean-f32 是全表唯一没动的家族
+  （k=15 7.6~10.3x、k=31 12.3~19.7x，中位 9.7x，远低于 u8 侧的 30~111x）。
+  **直接套 r65 的 `mean_cols_vec_kernel` 结构**：每线程 4 个连续 float 列 = 一次 float4 读 (16B)、
+  写 4 字节（1 个 float 列宽）→ 注意 f32 侧的「写」是每列 4B，4 列 = 16B（正好一个 float4），
+  所以**读写都能 16B 粒度**，比 u8 侧（读 8B/写 4B）更对称。tmp 是 float（tstep>>2）。
+  先把 probe_mcol3 的 sweep/rpt/bigk 三模式复制到 f32 版（新探针 probe_mcol4），
+  扫 rpt（起始档按 u8 的 8/12 猜，但 f32 每线程字节数翻倍，甜点可能更小），再集成。
+  回归面：`probe_f32f`（116 条断言，r45 建）+ smoke 的 mean-f32 k=3/15/31 三条。
+- ② **mean-f32 k=3 融合路径**已是 3.2~3.7x（r62 判为「小图固定成本」类，未动）；
+  若 ① 做完后 mean-f32 仍显著低于 u8 侧，再单独归因（先用 probe 分段，别直接改）。
+- ③ hist-gray 4K 1.52x 仍是全局最低项，但 r52 已判定为对手侧抖动、r61 三轮证明
   我方计时确定 —— 只有出现新证据（比如换计时法）才重开，勿反复试探。
-- ③ **process 坑（r64 新形态，务必记住）**：`run_bench.bat` 会 `cd /d build`，所以
-  CSV 落在 **`build/bench_results.csv`**；仓库根目录的 `bench_results.csv` 是历史遗留
-  **旧文件**。r64 第一次收数据时从根目录拷，拿到的全是 r63 的数字（差点误判「改动无效」）。
-  r59 记的是「从 build 拷到旧产物」，方向相反但同一个根因。**正确做法**：
-  `cp build/bench_results.csv docs/bench/bench_sm61_rNNx.csv`，并立即 `cmp` 两份确认不同。
+- ④ **process 坑（r64，务必记住）**：`run_bench.bat` 会 `cd /d build`，CSV 落在
+  **`build/bench_results.csv`**；仓库根目录的 `bench_results.csv` 是历史遗留**旧文件**。
+  正确做法：`cp build/bench_results.csv docs/bench/bench_sm61_rNNx.csv` 并立即 `cmp` 确认不同
+  （r65 已按此执行，两轮都 cmp 过 DIFFERENT_OK）。
+- ⑤ **r65 新认知可复用**：**「一行内 C 个连续列」的列遍拆法与行遍同源，不存在 sector 放大**；
+  真正的坑只有「一列 C 个连续行」那种拆法。下一轮做任何「沿 y 扫」的内核（f32 列遍、
+  gaussian 列遍、morph 列遍）第一件该确认的事就是：**warp 内 32 lane 是否覆盖同一行的连续地址**。
+  这条推翻了 r64 记录的「列方向 16 行不连续是唯一硬约束」的措辞——约束在「列」不在「行」，别被误导。
+
+### r65 本轮记录（2026-11-24）
+- [x] **mean 列遍重写**（BENCHMARK.md 第二十九轮）—— r64 把行遍修好后（4K k=31 3.54→0.48ms），
+      列遍反超成为主因：4K k=15 总 3.74ms = 行遍 ~1.37 + 列遍 ~2.36；k=31 总 1.50 = 0.48 + ~1.02。
+      1) **探针先行（PROGRESS 明确要求）**：新写 `docs/probes/probe_mcol2.cu`（102 用例三方比对 +
+         sweep）与 `probe_mcol3.cu`（ring 对照 + rpt 细扫 + bigk）。先量清「列方向写代价」这个
+         悬而未决的问题 —— **结论是该问题不存在**：一行内 C 个连续列在内存里连续，同一 warp 的
+         32 lane 在同一行覆盖 32*C 个连续列，读/写都是整段合并；只有「一列 C 个连续行」那种
+         拆法才有 sector 放大。**r64 记录的措辞（「列方向 16 行不连续」是硬约束）需要按此修正。**
+      2) **定案 `mean_cols_vec_kernel<C=4>`**：每线程 4 个连续列 + 行分块 rpt + 窗口滑动；
+         初始窗口 O(k) 直加一次被 rpt 行摊薄，之后每行「+新 −旧」O(1)/px。
+         读 `uint2`（8B = 4 个 u16）、写 `uint`（4B = 4 个 u8）。
+      3) **ring 路线否决（重点，勿重开）**：本来按 u8 行遍的经验想「每行只读一次 tmp」把流量
+         从 5B/px 降到 3B/px，用**寄存器 ring + 外层按 K 行展开**（内层 j 编译期常量，避免
+         r54 的 local memory 坑）。实测：k=31 时 `v[31][4]` = 124 个寄存器**溢出**，4K 反而
+         0.373→0.87~1.32ms；k=15 的 ringC4 也只与 vecC4 打平（0.3256 vs 0.3246）。
+         ⇒ **第二次读的是 half 行之前访问过的同一物理行，已被 L1/L2 吸收，不构成代价。**
+      4) **rpt 扫参**（probe_mcol3 rpt，9 档 × 3 轮轮转起点交错 min，排序稳定）：
+         k=15 → rpt=8 全尺寸最优（4K 0.3246 / 1080p 0.0979 / 720p 0.0594）；k=31 → rpt=12
+         全尺寸最优（4K 0.3727 / 1080p 0.1126 / 720p 0.0635）。定案 `rpt = (kh<=15) ? 8 : 12`，
+         不分尺寸档（避免 r49 那种噪声拟合）。
+      5) **kh>31 不纳入 vec**（probe_mcol3 bigk 实测）：k=255 的初始 O(k) 直加要 rpt=256 才
+         摊得平（4K 0.486ms，而 rpt=12 是 1.556ms > old_slide 1.053ms）；k=33 的 4K 最优点在
+         r12/r32 之间来回跳（不稳）。bench 只测 k=3/15/31，不为非 bench 路径引入未扫稳的规则
+         ⇒ `kh>31` 保留 old_slide，零回归。
+      6) **结果**（bench 两轮，均 120/120 WIN 零 lose）：mean k=15 7.2~8.1x→**30.2~33.4x**、
+         k=31 29.9~68.7x→**98.8~111.5x**。r65a min 1.523 / p10 2.724 / 中位 **12.270** /
+         max 111.525；r65b min 1.573 / p10 2.642 / 中位 12.317 / max 114.166。
+         中位从 r64 的 8.6x 提到 **12.3x**。
+      7) **验证**：`probe_mcol2 check` **132 用例** + `probe_mcol3 check` **48 用例**
+         （22/24 形状 × k ∈ {1,3,15,31,33,63} 或 {15,31} × {vec C4 四种 rpt, ring C1/C2/C4 四种 rpt}
+         vs old_blocked vs old_slide vs CPU **三方/四方逐值全 0**；形状含 16x1/16x2/17x3/8x1/
+         1x1/1x7/12x5 极扁、4096x64、1281x721 非 4 倍数宽、四档 bench 尺寸）；
+         `build_all.bat` 全量重编后 smoke **120 [OK]**。
+      8) **环境**：r65a 时钟 1493MHz（正常）、r65b 时钟 **607MHz**（r62 同样的塌频）——
+         speedup 是同轮比值所以 WIN 判定成立，但绝对 ms 不可与 r65a 横比。
+      9) **探针踩坑（新形态）**：① `cudaMemcpy2D` 的输出缓冲必须按 `dstep*(H-1)+W` 分配，
+         按 `W*H` 分配在 H>=2 时报 `invalid argument`（probe_mcol2 首跑即撞）；
+         ② `run_probe.bat` **不转发参数**（脚本写死 `.\%~1.exe`），要传参数得直接跑 exe；
+         ③ 模板里 `uint32_t o[C/4]` 在 C<4 时数组长度为 0 → 编译报「size must be greater than zero」，
+         需 `(C/4)?(C/4):1` 或提前 return。
+- **[待办 2026-11-24 r64 后，① 已由 r65 完成]** 原记录（保留供追溯）：
+  mean 列遍重写 —— r64 判定的两个病灶（blocked 每行 O(k) 直加 / slide 每线程一列并行度不足）
+  在 r65 都已被 `mean_cols_vec_kernel` 一次性替掉，见上。**此条关闭。**
+- **[仍待办 2026-11-21 r63 后] 其它候选**：
+  - **gaussian-f32 k=5 的 640x480（2.44~3.05x，家族里最低）与 mean k=3 720p/640
+    （2.16~2.72x）**：两个都是「小图上固定成本 + 占用率不足」的老问题，先做 probe 归因
+    （分段实测/地板标定**必须分尺寸**，r59 教训），别直接上内核。
+    r64 的 `probe_meanbig floor` 已给出 640x480 的参考地板：noop 0.0123ms（启动固定成本）、
+    f32cp 72.7 GB/s、u8->u16 56.3。**r65 后 mean k=3 640/720p 仍是 2.33/2.72x**（未变，符合预期
+    —— 那是融合路径，本轮没碰），这条候选依然有效。
+  - ② **hist-gray 4K 1.52x 仍是全局最低项**，但 r52 已判定为对手侧抖动、r61 三轮证明我方计时
+    确定 —— 只有出现新证据（比如换计时法）才重开，勿反复试探。
+  - ③ r63 新认知可复用：**f32 融合内核的 15 级 fmaf 依赖链靠「跨迭代软件预取」能填平**
+    （k=15 实测 1.63x）。若将来做 k=9/k=31 的 f32 融合，直接套 probe_gf32k15d 的结构 +
+    launch_bounds(256,2) + TH=192/th=128 起点，不必从零扫参。
+  - ④ r64 新认知可复用：**「一线程 16 个连续输出、攒寄存器后 16B 向量写」是 sm_61 上被反复
+    验证的甜点结构**（integral r50 的 pass1、mean r64 的行遍都靠它拿到 2~7x）。
+  - ⑤ r65 新认知（**取代 r64 ④ 的后半句**）：**列遍套这个结构时，「一行内 C 个连续列」与行遍
+    同源、没有 sector 放大**（probe_mcol2/3 实测）；唯一有放大的是「一列 C 个连续行」。
+    下一轮做 f32 列遍（候选①）直接照抄，不必再证一遍。
 
 ### r64 本轮记录（2026-11-24）
 - [x] **mean 大核行遍重写**（BENCHMARK.md 第二十八轮）—— 全表最丑的绝对耗时项
@@ -535,9 +600,16 @@ G:\cuda-kernel
   3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
      每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
   4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
-- 同步状态（2026-11-24 r64 现场核实）：本轮 1 个 commit —— `75c0fed`（mean 大核行遍重写 +
+- 同步状态（2026-11-24 r65 现场核实）：本轮 1 个 commit —— `ee6c927`（mean 列遍重写 +
+  probe_mcol2/probe_mcol3 + 两轮 CSV r65a/r65b）。
+  `bash scripts/push.sh` 亲眼看到 **SYNC_OK ee6c927**（第 1 次尝试成功，proxy=直连）。
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致
+  （均 ee6c92797ed0533aa4d7aa5931717eb680d6ef4a）、`git status` 干净。
+  `git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
+  `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。（以上为本轮现场核实，非照抄。）
+- 上一轮同步状态（2026-11-24 r64，历史）：本轮 1 个 commit —— `75c0fed`（mean 大核行遍重写 +
   BENCHMARK 第二十八轮 + probe_meanbig/probe_mr31 + 两轮 CSV r64a/r64b）。
-  `bash scripts/push.sh` 亲眼看到 **SYNC_OK 75c0fed**（第 1 次尝试成功，proxy=直连；
+  `bash scripts/push.sh` 亲眼看到 **SYNC_OK 75c0fed**（第 1 次尝试成功，proxy=直连）；
   r63 记的仓库级 `http.proxy`=127.0.0.1:7897 已在 r63 清除，本轮未复现）。
   `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致（均 75c0fed）、
   `git status` 干净。`git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
@@ -575,6 +647,15 @@ G:\cuda-kernel
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
+- 优化（2026-11-24，r65）：mean 列遍重写（BENCHMARK.md 第二十九轮）——
+  `mean_cols_vec_kernel<C=4>`：每线程 4 个连续列 + 行分块 rpt + 窗口滑动，
+  替掉 `mean_cols_blocked_kernel`（每行 O(k) 直加，4K k=15 3.11ms/8.0 GB/s）与
+  `mean_cols_kernel`（每线程一列，4K 0.93ms/26.9 GB/s）。
+  **关键认识**：「一行内 C 个连续列」与行遍同源、无 sector 放大；只有「一列 C 个连续行」才有。
+  **ring 路线（每行只读一次）实测否决**：k=31 的 `v[31][4]`=124 regs 溢出，反而慢 2~3 倍，
+  第二次读已被 L1/L2 吸收。rpt 定案 8（kh<=15）/12（kh>15），kh>31 不纳入 vec。
+  结果：mean k=15 7.2~8.1x→**30.2~33.4x**、k=31 29.9~68.7x→**98.8~111.5x**；
+  两轮 bench 均 120/120 WIN，中位 8.6→**12.3x**。详见文末 r65 记录。
 - [x] 项目全部完成（2026-09-28）：6 算子全尺寸稳定超过 OpenCV-CUDA；后续如续作可做非 benchmark 路径
       的补充核（如 hist 非 16 倍数宽度的向量化、k=7 高斯定点路径、CV_32F 输入格式），非必需
 - [x] 增补（2026-09-30）：histogram 任意宽度向量化路径（W 非 16 倍数/不对齐的 hist_vec_lastblock_kernel，
