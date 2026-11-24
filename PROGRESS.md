@@ -53,17 +53,11 @@ G:\cuda-kernel
 - 对比口径：都含 H2D 就绪后的纯 GPU 时间（cudaEvent 包住 kernel 或含拷贝分两栏报告，明确标注）
 
 ## 当前下一步（cron 续作从这里接）
-- **[待办 2026-11-24 r65 后] ① mean-f32 列遍重写（现在是 mean 家族唯一没重写的列遍，证据齐全）**：
-  r65 把 u8 列遍从 8~27 GB/s 拉到 66~77 GB/s（`mean_cols_vec_kernel<4>`），但 **f32 侧列遍
-  还是老路径** —— `mean32_cols_blocked_kernel`（k<=15，每输出行 O(k) 直加）/
-  `mean32_cols_kernel`（k>15，每线程一列沿 y 走）。r65b 实测 mean-f32 是全表唯一没动的家族
-  （k=15 7.6~10.3x、k=31 12.3~19.7x，中位 9.7x，远低于 u8 侧的 30~111x）。
-  **直接套 r65 的 `mean_cols_vec_kernel` 结构**：每线程 4 个连续 float 列 = 一次 float4 读 (16B)、
-  写 4 字节（1 个 float 列宽）→ 注意 f32 侧的「写」是每列 4B，4 列 = 16B（正好一个 float4），
-  所以**读写都能 16B 粒度**，比 u8 侧（读 8B/写 4B）更对称。tmp 是 float（tstep>>2）。
-  先把 probe_mcol3 的 sweep/rpt/bigk 三模式复制到 f32 版（新探针 probe_mcol4），
-  扫 rpt（起始档按 u8 的 8/12 猜，但 f32 每线程字节数翻倍，甜点可能更小），再集成。
-  回归面：`probe_f32f`（116 条断言，r45 建）+ smoke 的 mean-f32 k=3/15/31 三条。
+- **[待办 2026-11-24 r65 后，① 已由 r66 完成]** ① mean-f32 列遍重写 —— r65b 时 mean-f32 是全表
+  唯一没动的家族（k=15 7.6~10.3x、k=31 12.3~19.7x，中位 9.7x）。r66 照搬 r65 的
+  `mean_cols_vec_kernel` 结构写成 `mean32_cols_vec_kernel<C=4>`（每线程 4 个连续 float 列，
+  读 float4 16B / 写 float4 16B，比 u8 侧更对称）；**rpt 规律与 u8 侧相反**——f32 侧最优点在
+  rpt=3（kh<=15）/4（kh>15），定案该规则。**此条关闭**，见文末 r66 记录。
 - ② **mean-f32 k=3 融合路径**已是 3.2~3.7x（r62 判为「小图固定成本」类，未动）；
   若 ① 做完后 mean-f32 仍显著低于 u8 侧，再单独归因（先用 probe 分段，别直接改）。
 - ③ hist-gray 4K 1.52x 仍是全局最低项，但 r52 已判定为对手侧抖动、r61 三轮证明
@@ -76,6 +70,41 @@ G:\cuda-kernel
   真正的坑只有「一列 C 个连续行」那种拆法。下一轮做任何「沿 y 扫」的内核（f32 列遍、
   gaussian 列遍、morph 列遍）第一件该确认的事就是：**warp 内 32 lane 是否覆盖同一行的连续地址**。
   这条推翻了 r64 记录的「列方向 16 行不连续是唯一硬约束」的措辞——约束在「列」不在「行」，别被误导。
+
+### r66 本轮记录（2026-11-25）
+- [x] **mean-f32 列遍重写**（BENCHMARK.md 第三十轮）—— r65b 全量 bench 里 mean-f32 是
+      全表唯一没动的家族（k=15 7.6~10.3x、k=31 12.3~19.7x，中位 9.7x，远低于 u8 侧 30~111x）。
+      病灶 = 列遍仍是老路径，与 u8 侧 r65 替换掉的两个内核**完全同构**：
+      `mean32_cols_blocked_kernel`（k<=15，每输出行 O(k) 直加 ⇒ 45B/px）与
+      `mean32_cols_kernel`（k>15，每线程一列沿 y 走 ⇒ 并行度不足）。
+      1) **探针先行（PROGRESS 明确要求）**：新写 `docs/probes/probe_mcol4.cu`（check 48 用例
+         三方/四方比对 + sweep 四尺寸地板 + rpt 9 档扫参 + bigk），结构照搬 r65 的
+         `mean_cols_vec_kernel<C=4>`。r65 新认知直接复用：**「一行内 C 个连续列」与行遍同源、
+         无 sector 放大**（唯一有放大的是「一列 C 个连续行」的拆法），f32 侧每线程 4 个连续
+         float 列，读 = float4（16B），写 = float4（16B），比 u8 侧（读 8B/写 4B）更对称。
+      2) **rpt 规律与 u8 侧相反（重点）**：f32 每线程字节数翻倍，行分块越小越有利，甜点在
+         **rpt=3（kh<=15）/ rpt=4（kh>15）**（u8 侧是 8/12）。9 档 × 3 轮轮转起点交错 min，
+         排序稳定；定案 `rpt = (kh<=15) ? 3 : 4`，不做分尺寸档（避免 r49 那种噪声拟合）。
+      3) **结果**（`probe_mcol4 sweep` 同轮交错）：4K k=15 1.072→0.790、k=31 1.050→0.912；
+         1080p k=15 0.219→0.193、k=31 0.255/0.308→0.201；720p k=15 0.113→0.089、
+         k=31 0.132→0.102；640 k=15 0.049→0.039、k=31 0.056→0.053。
+      4) **bench 两轮，均 120/120 WIN 零 lose**：mean-f32 k=15 8.6~12.2x（原 7.9~10.2x）、
+         k=31 16.6~20.5x（原 12.6~19.8x）；r66a min 1.470 / p10 2.528 / 中位 **12.279** /
+         max 113.641；r66b min 1.478 / p10 2.705 / 中位 **12.349** / max 116.164。
+      5) **验证**：`probe_mcol4 check` **48 用例**（24 形状 × k=15/31）vec vs 旧内核（容差 1e-3）
+         全 0 + 旧内核 vs CPU float 复刻参照逐值全 0（含 16x1/16x2/17x3/8x1/1x1/1x7/12x5 极扁、
+         4096x64、1281x721 非 4 倍数宽、四档 bench 尺寸）；`build_all.bat` 全量重编后 smoke
+         **120 [OK]**（mean f32 k=15/31 max diff = 1.526e-05，与 k=3 融合路径同量级）。
+      6) **探针踩坑（新形态）**：f32 滑动更新是 `acc += (新行 - 旧行)`（一次累加），旧内核是
+         `acc += 新; acc -= 旧`（两次累加）—— float 结合律差异 ~1e-6，**不能像 u8 那样逐位
+         比对**，check 判据改为「vec vs 旧内核容差 1e-3 + 旧内核 vs CPU 复刻逐值」。
+      7) **环境**：两轮期间 GPU 时钟在 139MHz ↔ 1721MHz 间爬升（跑 bench 前 139MHz，跑完 1721），
+         speedup 是同轮比值所以 WIN 判定成立，但**绝对 ms 不可与 r65 横比**。
+      8) **约束**：与 u8 侧一致——`width % 4 == 0`、`width >= 4`、`kh <= 31`、dst 16B 对齐
+         走 vec；kh>31 沿用 u8 侧 probe_mcol3 bigk 的结论保留 old_slide（零回归）。
+      CSV 落 docs/bench/bench_sm61_r66a.csv / r66b；探针落 docs/probes/probe_mcol4.cu。
+- **[待办 2026-11-24 r65 后，① 已由 r66 完成]** 原记录（保留供追溯）：
+  mean-f32 列遍重写（详见文末 r66 记录）。**此条关闭。**
 
 ### r65 本轮记录（2026-11-24）
 - [x] **mean 列遍重写**（BENCHMARK.md 第二十九轮）—— r64 把行遍修好后（4K k=31 3.54→0.48ms），
@@ -657,6 +686,12 @@ G:\cuda-kernel
 - 上一轮同步状态（2026-11-09 r52，历史）：`c79584e` + `e6395a9` + `ddfb959`，SYNC_OK ddfb959。
 - 注意：git 仓库不能破坏，只许 add/commit，禁止 reset/checkout 丢工作；每完成一阶段 commit 一次
 - [x] 收尾（阶段 5）：README.md 已写（构建方法、API、benchmark 复现步骤、结果摘要、踩坑总结）
+- 优化（2026-11-25，r66）：mean-f32 列遍重写（BENCHMARK.md 第三十轮）——
+  `mean32_cols_vec_kernel<C=4>`：照搬 r65 的 `mean_cols_vec_kernel` 结构，每线程 4 个连续
+  float 列（读 float4 16B / 写 float4 16B），替掉 `mean32_cols_blocked_kernel`（每行 O(k) 直加，
+  45B/px）与 `mean32_cols_kernel`（每线程一列）。**rpt 规律与 u8 侧相反**：f32 甜点 rpt=3/4
+  （u8 是 8/12）。结果 mean-f32 k=15 7.9~10.2x→**8.6~12.2x**、k=31 12.6~19.8x→**16.6~20.5x**；
+  两轮 bench 均 120/120 WIN，中位维持 12.3x。详见文末 r66 记录。
 - 优化（2026-11-24，r65）：mean 列遍重写（BENCHMARK.md 第二十九轮）——
   `mean_cols_vec_kernel<C=4>`：每线程 4 个连续列 + 行分块 rpt + 窗口滑动，
   替掉 `mean_cols_blocked_kernel`（每行 O(k) 直加，4K k=15 3.11ms/8.0 GB/s）与
