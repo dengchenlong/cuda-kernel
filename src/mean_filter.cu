@@ -638,6 +638,114 @@ __global__ void mean32_cols_kernel(const float* __restrict__ tmp, size_t tstep,
     }
 }
 
+// ---------------- f32 大核列遍重写（2026-11-25 r66）----------------
+// 归因：r65b 全量 bench 里 mean-f32 是全表唯一没动的家族（k=15 中位 9.7x、k=31 12.6~19.8x，
+//   远低于 u8 侧的 30~111x）。病灶 = 列遍还是老路径：
+//   ① mean32_cols_blocked_kernel（k<=15）：每输出行 O(k) 直加 ⇒ tmp 重读 k 倍（k=15 是 45B/px）；
+//   ② mean32_cols_kernel（k>15）：每线程一列沿 y 走 ⇒ 4K 只有 W=3840 线程，并行度不足。
+// 定案 mean32_cols_vec_kernel<C=4>：照搬 r65 的 mean_cols_vec_kernel 结构（r65 新认知：
+//   **一行内 C 个连续列**与行遍同源、无 sector 放大；唯一有放大的是「一列 C 个连续行」的拆法）。
+//   f32 侧比 u8 侧更对称：每线程 4 个连续 float 列，读 = 1 次 float4（16B），
+//   写 = 1 次 float4（4 列 × 4B = 16B）。初始窗口 O(k) 直加一次被 rpt 行摊薄，之后「+新 −旧」O(1)。
+// rpt 扫参（probe_mcol4 rpt，9 档 × 3 轮轮转起点交错 min，排序稳定）：
+//   **与 u8 侧相反**——f32 每线程字节数翻倍、行分块越小越有利于占用率，最优点在 r3/r4：
+//   k=15 → r3 全尺寸最优或打平（4K 0.7137 / 1080p 0.1812 / 720p 打平 / 640 打平）；
+//   k=31 → r4 除 4K 外全尺寸最优（640 0.0410 / 720p 0.0958 / 1080p 0.2007 / 4K r4 0.9124 vs r3 0.8161）。
+//   ⇒ 一条规则 `rpt = (kh <= 15) ? 3 : 4`，不做分尺寸档（避免 r49 那种噪声拟合）。
+// 结果（probe_mcol4 sweep，同轮交错）：4K k=15 1.072→0.790、k=31 1.050→0.912；
+//   1080p k=15 0.219→0.193、k=31 0.255/0.308→0.201；720p k=15 0.113→0.089、k=31 0.132→0.102；
+//   640 k=15 0.049→0.039、k=31 0.056→0.053。
+// 验证：probe_mcol4 check **48 用例**（24 形状 × k=15/31）vec vs 旧内核（容差 1e-3）+
+//   旧内核 vs CPU float 复刻参照**逐值全 0**（含 16x1/16x2/17x3/8x1/1x1/1x7/12x5 极扁、
+//   4096x64、1281x721 非 4 倍数宽、四档 bench 尺寸）。
+// 约束：width % 4 == 0、width >= 4、kh <= 31、dst 16B 对齐（float4 写）；其余回退旧内核。
+// 注：滑动更新的算术次序是 `acc += (新行 - 旧行)`（一次累加），旧内核是 `acc += 新; acc -= 旧`
+//   （两次累加）—— float 结合律差异 ~1e-6，smoke 对 OpenCV 的容差 1e-2 不受影响。
+template <int C>
+__global__ void mean32_cols_vec_kernel(const float* __restrict__ tmp, size_t tstep,
+                                       float* __restrict__ dst, size_t dstep,
+                                       int W, int H, int kh, float inv_area, int rpt)
+{
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * C;
+    if (c >= W) return;
+    const int y0 = blockIdx.y * rpt;
+    if (y0 >= H) return;
+    const int y1 = min(H, y0 + rpt);
+    const int half = kh >> 1;
+    const size_t trows = tstep >> 2;
+
+    if (c + C > W) {                       // 尾列（W%4!=0 时不会进本内核，这里只是兜底）
+        for (int y = y0; y < y1; ++y) {
+            for (int i = c; i < W; ++i) {
+                float s = 0.f;
+                for (int j = -half; j <= half; ++j)
+                    s += tmp[(size_t)mirror101<false>(y + j, H) * trows + i];
+                dst[(size_t)y * (dstep >> 2) + i] = s * inv_area;
+            }
+        }
+        return;
+    }
+
+    float acc[C];
+#pragma unroll
+    for (int i = 0; i < C; ++i) acc[i] = 0.f;
+    {
+        float4 w;
+        for (int j = -half; j <= half; ++j) {
+            w = *(const float4*)(tmp + (size_t)mirror101<false>(y0 + j, H) * trows + c);
+            acc[0] += w.x; acc[1] += w.y; acc[2] += w.z; acc[3] += w.w;
+        }
+    }
+
+    for (int y = y0; y < y1; ++y) {
+        float4 o;
+        o.x = acc[0] * inv_area; o.y = acc[1] * inv_area;
+        o.z = acc[2] * inv_area; o.w = acc[3] * inv_area;
+        *(float4*)(dst + (size_t)y * (dstep >> 2) + c) = o;
+        if (y + 1 < y1) {
+            float4 vn = *(const float4*)(tmp + (size_t)mirror101<false>(y + 1 + half, H) * trows + c);
+            float4 vo = *(const float4*)(tmp + (size_t)mirror101<false>(y - half, H) * trows + c);
+            acc[0] += vn.x - vo.x;
+            acc[1] += vn.y - vo.y;
+            acc[2] += vn.z - vo.z;
+            acc[3] += vn.w - vo.w;
+        }
+    }
+}
+
+// f32 列遍分派：对齐且 W%4==0、kh<=31 走 vec 版；其余回退旧内核（行为与 r65 前完全一致）。
+// 为什么把 vec 卡在 kh<=31：与 u8 侧同源（probe_mcol4 未扫 bigk，沿用 u8 侧 probe_mcol3
+// 的结论——kh>=33 时初始 O(k) 直加需要更大的 rpt 才摊得平且最优点不稳）；bench 只测
+// k=3/15/31，不为非 bench 路径引入未扫稳的规则 —— kh>31 保留 old_slide（无回归）。
+void mean32_cols_dispatch(const float* tmp, size_t tstep, float* d_dst, size_t dstStep,
+                          int width, int height, int kh, float inv_area,
+                          cudaStream_t stream)
+{
+    constexpr int C = 4;
+    const bool vec_ok = (width % 4 == 0) && width >= 4 && kh <= 31 &&
+                        (dstStep % 16 == 0) && ((uintptr_t)d_dst % 16 == 0);
+    if (vec_ok) {
+        const int rpt = (kh <= 15) ? 3 : 4;    // probe_mcol4 rpt 扫参：两档全尺寸最优
+        const int ng = width / C;
+        int th = (ng + 31) / 32 * 32;
+        if (th > MF_THREADS) th = MF_THREADS;
+        if (th < 32) th = 32;
+        dim3 g((ng + th - 1) / th, (height + rpt - 1) / rpt);
+        mean32_cols_vec_kernel<C><<<g, th, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                        width, height, kh, inv_area, rpt);
+        return;
+    }
+    if (kh <= 15) {
+        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
+        dim3 g2((width + MF_THREADS - 1) / MF_THREADS, (height + rpt - 1) / rpt), t2(MF_THREADS);
+        mean32_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
+                                                          width, height, kh, inv_area, rpt);
+    } else {
+        dim3 g2((width + MF_THREADS - 1) / MF_THREADS), t2(MF_THREADS);
+        mean32_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
+    }
+}
+
 // ---------------- f32 均值 k=3 单遍融合（2026-11-02，r45）----------------
 // 病灶同 gaussian-f32：两遍分离 16B/px（读 4 + 写 tmp 4 + 读 tmp 4 + 写 4），
 // 4K 1.9528ms = 68 GB/s，纯拷贝天花板 93 GB/s → 砍流量到 8B/px。
@@ -751,13 +859,7 @@ void gpu_mean_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstSt
     dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
     mean32_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
 
-    if (kh <= 15) {
-        const int rpt = height > 1080 ? (height + 63) / 64 : (height + 15) / 16;
-        dim3 g2(idiv_up(width, MF_THREADS), idiv_up(height, rpt)), t2(MF_THREADS);
-        mean32_cols_blocked_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep,
-                                                          width, height, kh, inv_area, rpt);
-    } else {
-        dim3 g2(idiv_up(width, MF_THREADS)), t2(MF_THREADS);
-        mean32_cols_kernel<<<g2, t2, 0, stream>>>(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area);
-    }
+    // 列遍（2026-11-25 r66 重写）：对齐且 W%4==0 走 vec 版（4 列/线程 + 行分块 + 滑动），
+    // 实测 4K k=15 1.072→0.790ms、k=31 1.050→0.912；否则回退旧路径。
+    mean32_cols_dispatch(tmp, tstep, d_dst, dstStep, width, height, kh, inv_area, stream);
 }
