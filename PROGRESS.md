@@ -629,7 +629,15 @@ G:\cuda-kernel
   3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
      每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
   4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
-- 同步状态（2026-11-24 r65 现场核实）：本轮 1 个 commit —— `ee6c927`（mean 列遍重写 +
+- 同步状态（2026-11-25 r66 现场核实）：本轮 2 个 commit —— `d237928`（mean-f32 列遍重写 +
+  probe_mcol4 + 两轮 CSV r66a/r66b）和 `a256f41`（r66 PROGRESS 记录）。
+  `bash scripts/push.sh` 亲眼看到 **SYNC_OK a256f41**（第 1 次尝试成功，proxy=127.0.0.1:7897）。
+  `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致
+  （均 a256f41fdfcd57488ae927e9d249b7c32a037a40）、`git status` 干净。
+  `git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
+  `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。
+  （以上为本轮现场核实，非照抄。）
+- 上一轮同步状态（2026-11-24 r65，历史）：本轮 1 个 commit —— `ee6c927`（mean 列遍重写 +
   probe_mcol2/probe_mcol3 + 两轮 CSV r65a/r65b）。
   `bash scripts/push.sh` 亲眼看到 **SYNC_OK ee6c927**（第 1 次尝试成功，proxy=直连）。
   `git ls-remote --heads origin main` 与 `git rev-parse HEAD` 核对一致
