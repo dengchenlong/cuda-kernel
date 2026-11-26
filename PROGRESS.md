@@ -672,15 +672,15 @@ G:\cuda-kernel
   3) 流程注意：benchmark 的 CSV 是**覆盖写**（fopen "w"）——同目录连跑两轮时第二轮会覆盖第一轮，
      每轮跑完必须立即另存（本轮 r60a 在 r60b 启动前先 cp 成 bench_r60a.csv 才保住数据）。
   4) 环境备注：C 盘可用空间已回升到 1.3G（r59 时 0 字节），本轮临时文件仍走 G:\tmp 保险。
-- 同步状态（2026-11-27 r67 现场核实）：本轮 1 个 commit —— `6aaf7ef`（u8 高斯 k=15 单遍融合 +
-  probe_g15u8 + 两轮 CSV r67a/r67b + BENCHMARK 第三十一轮 + PROGRESS 记录）。
-  `bash scripts/push.sh` 亲眼看到 **SYNC_OK 6aaf7ef**（第 1 次直连 TLS 失败，
-  第 2 次直连成功；push.sh 内部的 `ls-remote` 校验与本地 HEAD 一致才打印 SYNC_OK）。
-  推送后的独立复核 `git ls-remote --heads origin main` 两次遇到同一 TLS 抖动
-  （curl 直连 7897 代理均 000、DNS 解析落在 198.18.0.149 劫持段）——
-  与 r65 记录的「链路抖动、非仓库配置问题」同型，**不影响 SYNC_OK 结论**（该结论来自
-  push.sh 内一次成功的 ls-remote，不是 git push 的回显）。`git status` 干净；
-  `git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
+- 同步状态（2026-11-27 r67 现场核实）：本轮 2 个 commit —— `6aaf7ef`（u8 高斯 k=15 单遍融合 +
+  probe_g15u8 + 两轮 CSV r67a/r67b + BENCHMARK 第三十一轮 + PROGRESS 记录）与
+  `bb5f166`（本同步状态行）。`bash scripts/push.sh` 两次都亲眼看到 SYNC_OK：
+  **SYNC_OK 6aaf7ef**、**SYNC_OK bb5f166**（两次都是第 1 次直连 TLS 失败、第 2 次直连成功；
+  push.sh 内部的 `ls-remote` 与本地 HEAD 一致才打印 SYNC_OK，不是 git push 回显）。
+  推送后的独立复核 `git ls-remote --heads origin main` 多次遇到同一 TLS 抖动
+  （curl 直连与 7897 代理均返回 000，DNS 解析落在 198.18.0.149 劫持段）——
+  与 r65 记录的「链路抖动、非仓库配置问题」同型，**不影响 SYNC_OK 结论**。
+  `git status` 干净；`git branch -a` 现场核实：本地仍只有 `main` + 两个已合入 main 的
   `spike-hist4k` / `spike-clock-lock`（非遗留问题，勿再列为待办）。（以上为本轮现场核实，非照抄。）
 - 同步状态（2026-11-25 r66 现场核实）：本轮 2 个 commit —— `d237928`（mean-f32 列遍重写 +
   probe_mcol4 + 两轮 CSV r66a/r66b）和 `a256f41`（r66 PROGRESS 记录）。
