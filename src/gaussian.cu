@@ -577,6 +577,147 @@ __global__ void g5_copy16_kernel(const uint8_t* __restrict__ s, size_t sstep,
     }
 }
 
+// ---------------- u8 k=15 单遍融合（2026-11-27 r67）----------------
+// 病灶：k=15 一直走 v4 两遍 float tmp（读 1B + 写 4B + 读 4B + 写 1B = 10B/px），
+// 4K 1.83ms 折算只有 45 GB/s（纯 uint4 拷贝天花板 93 GB/s），是 gaussian 家族最低项
+// （2.53~2.80x，四尺寸全低于其它核）。f32 侧 r63 已用单遍融合拿到 1.63x，u8 侧一直漏着。
+// 定案 `gauss15_fuse_kernel<K,TH,LBM,LBPB>`：结构照搬 gauss32_fuse15_kernel ——
+// 4 px/线程（u8 侧一次读 uint 4B）、寄存器滚动 K 行「水平部分和」、跨迭代软件预取
+// （下一行 load 提前发，15 级 fmaf 依赖链靠预取填延迟）、__launch_bounds__(256,2)。
+// 算术次序与 v4 两遍路径完全同序（行 fmaf 从 0.f 起、列 fmaf 从 0.f 起）→ 逐位一致。
+// 原地口径（benchmark 是 src==dst）：4px×256th 只覆盖 1024 列，4K 一行 4 个 block，
+// 跨 block 水平 halo 会被邻块写掉（r48 的 k=7 同款坑）；单块覆盖整行需 960 线程
+// （128 regs 不允许）→ 原地走「融合写 workspace + 整图 uint4 拷回」= 4B/px（仍远低于 10）。
+// 约束：W%4==0、8<=W<=4096、16B 对齐；其余回退 v4 两遍路径（结果一致）。
+// v4 两遍路径的边界语义：单次折叠 + clamp（**不是**周期镜像 —— 改周期会让 k>7 的输出
+// 与旧路径不再逐位一致，r45 记录过同款结论）。融合路径必须沿用同一函数。
+__device__ __forceinline__ int g15_mirror(int r, int H)
+{
+    int rr = r;
+    if (rr < 0)  rr = -rr;
+    if (rr >= H) rr = 2 * H - 2 - rr;
+    return max(0, min(H - 1, rr));
+}
+
+template <int K, int TH, int LBM, int LBPB>
+__global__ void __launch_bounds__(LBM, LBPB)
+gauss15_fuse_kernel(const uint8_t* __restrict__ src, size_t sstep,
+                    uint8_t* __restrict__ dst, size_t dstep, int W, int H)
+{
+    constexpr int HALF = K / 2;
+    const int tid  = threadIdx.x;
+    const int x0   = (blockIdx.x * blockDim.x + tid) * 4;
+    const int y0   = blockIdx.y * TH;
+    const int y1   = min(H, y0 + TH);
+    const int lane = tid & 31;
+    const bool act = (x0 < W);
+    const int xa   = act ? x0 : ((W - 4) & ~3);   // 非活跃线程给 4B 安全地址，仍参与 shuffle
+    const int rows = (int)sstep, orows = (int)dstep;
+
+    float h[K][4];
+
+    auto hrow = [&](int ry, uint w4, float o[4]) {
+        const uint8_t* rp = src + (size_t)ry * rows;
+        float v0 = (float)( w4       & 255u);
+        float v1 = (float)((w4 >>  8) & 255u);
+        float v2 = (float)((w4 >> 16) & 255u);
+        float v3 = (float)((w4 >> 24) & 255u);
+        float L[HALF], Rt[HALF];
+#pragma unroll
+        for (int j = 1; j <= HALF; ++j) {
+            const int d = (j - 1) / 4 + 1;
+            const int c = (j - 1) % 4;
+            float lv, rv;
+            if (c == 0)      { lv = __shfl_up_sync(0xffffffffu, v3, d); rv = __shfl_down_sync(0xffffffffu, v0, d); }
+            else if (c == 1) { lv = __shfl_up_sync(0xffffffffu, v2, d); rv = __shfl_down_sync(0xffffffffu, v1, d); }
+            else if (c == 2) { lv = __shfl_up_sync(0xffffffffu, v1, d); rv = __shfl_down_sync(0xffffffffu, v2, d); }
+            else             { lv = __shfl_up_sync(0xffffffffu, v0, d); rv = __shfl_down_sync(0xffffffffu, v3, d); }
+            L[j - 1]  = lv;
+            Rt[j - 1] = rv;
+        }
+        // 跨 warp / 图像边界必须自己取（shfl 越界 lane 无意义）
+        if (lane < 2 || xa < HALF) {
+#pragma unroll
+            for (int j = 1; j <= HALF; ++j) L[j - 1] = (float)rp[g15_mirror(xa - j, W)];
+        }
+        if (lane > 29 || xa + 4 + HALF > W) {
+#pragma unroll
+            for (int j = 1; j <= HALF; ++j) Rt[j - 1] = (float)rp[g15_mirror(xa + 3 + j, W)];
+        }
+        float pb[4 + 2 * HALF];
+#pragma unroll
+        for (int j = 0; j < HALF; ++j) pb[j] = L[HALF - 1 - j];
+        pb[HALF + 0] = v0; pb[HALF + 1] = v1; pb[HALF + 2] = v2; pb[HALF + 3] = v3;
+#pragma unroll
+        for (int j = 0; j < HALF; ++j) pb[HALF + 4 + j] = Rt[j];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float s = 0.f;
+#pragma unroll
+            for (int q = 0; q < K; ++q) s = fmaf(c_w[q], pb[i + q], s);
+            o[i] = s;
+        }
+    };
+    auto ld = [&](int ry) { return *(const uint*)(src + (size_t)ry * rows + xa); };
+
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int ry = g15_mirror(y0 - HALF + i, H);
+        hrow(ry, ld(ry), h[i]);
+    }
+
+    int rcur = g15_mirror(y0 + HALF + 1, H);       // 首迭代要算的行（h 已含到 y0+HALF）
+    uint wcur = ld(rcur);
+    for (int y = y0; y < y1; ++y) {
+        const int rnext = g15_mirror(y + HALF + 2, H);   // 下一迭代要算的行，提前发
+        const uint wnext = ld(rnext);
+        float hn[4];
+        hrow(rcur, wcur, hn);
+        if (act) {
+            float vv[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float s = 0.f;
+#pragma unroll
+                for (int q = 0; q < K; ++q) s = fmaf(c_w[q], h[q][j], s);
+                vv[j] = s;
+            }
+            uint32_t o = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int v = __float2int_rn(vv[j]);      // 与 gauss_cols4_kernel 同一舍入语义
+                v = max(0, min(255, v));
+                o |= (uint32_t)v << (8 * j);
+            }
+            *(uint*)(dst + (size_t)y * orows + x0) = o;
+        }
+#pragma unroll
+        for (int i = 0; i < K - 1; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) h[i][j] = h[i + 1][j];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) h[K - 1][j] = hn[j];
+        wcur = wnext; rcur = rnext;
+    }
+}
+
+void gauss15_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
+                   int width, int height, int TH, int th, cudaStream_t stream)
+{
+    if (th < 32)   th = 32;
+    if (th > 256)  th = 256;
+    th = (th + 31) / 32 * 32;          // __launch_bounds__(256,2) 上限 256，且必须是整 warp
+    dim3 g(idiv_up(width, 4 * th), idiv_up(height, TH));
+    switch (TH) {
+    case 32:  gauss15_fuse_kernel<15, 32,  256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 48:  gauss15_fuse_kernel<15, 48,  256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 64:  gauss15_fuse_kernel<15, 64,  256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 96:  gauss15_fuse_kernel<15, 96,  256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    case 128: gauss15_fuse_kernel<15, 128, 256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    default:  gauss15_fuse_kernel<15, 192, 256, 2><<<g, th, 0, stream>>>(d_src, srcStep, d_dst, dstStep, width, height); break;
+    }
+}
+
 template <bool STASH>
 void gauss5_fused(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstStep,
                   int width, int height, int TH, const uint8_t* stash, size_t stashStep,
@@ -970,6 +1111,42 @@ void gpu_gaussian(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t d
     float hw[MAX_K];
     make_gauss_kernel(ksize, sigma, hw);
     upload_w(hw, ksize, stream);
+
+    // k=15 单遍融合（2026-11-27 r67）：见 gauss15_fuse_kernel 注释。
+    // TH/th 分档（probe_g15u8 sweep，四尺寸 × 17 档 × 4 轮轮转起点交错 min）：
+    //   oop 甜点：640 T32/th192 0.0676（两遍 0.0778，1.15x）、720p T96/th64 0.1669
+    //     （0.2038，1.22x）、1080p T192/th128 0.2929（0.4383，1.50x）、
+    //     4K T192/th64 **1.0148**（1.7132，1.69x）。
+    //   原地（benchmark 口径，ws+整图拷回）甜点：640 无收益（0.1085 vs 0.0758，走 v4）；
+    //     720p T96/th64 0.1823（0.2007，1.10x）、1080p T192/th128 0.3359（0.4362，1.30x）、
+    //     4K T192/th64 1.1807（1.7091，1.45x）。
+    //   **th 是 64 而不是 256**：128 regs/线程 ⇒ 256 线程块 2 块/SM（512 线程/SM 占用率仅 25%），
+    //   th=64 时 8 块/SM、每块还能独立推进 chunk 边界，寄存器不变而块级并行度翻 4 倍。
+    //   小图反过来（640 oop th=192 才够块数），与「小图并行度是唯一抓手」一致。
+    if (ksize == 15) {
+        const bool inplace15 = ((const void*)d_src == (const void*)d_dst);
+        const bool fuse15 = (width >= 8 && width <= 4096 && (width % 4 == 0) &&
+                             (srcStep % 16 == 0) && (dstStep % 16 == 0) &&
+                             ((uintptr_t)d_src % 16 == 0) && ((uintptr_t)d_dst % 16 == 0));
+        if (fuse15 && !inplace15) {
+            const int TH = (height > 800) ? 192 : (height > 600 ? 96 : 32);
+            const int th = (height > 600) ? 64 : 192;
+            gauss15_fused(d_src, srcStep, d_dst, dstStep, width, height, TH, th, stream);
+            return;
+        }
+        if (fuse15 && inplace15 && height >= 700) {
+            const int TH = (height > 800) ? 192 : 96;
+            const int tstep = (width + 15) & ~15;
+            uint8_t* tmp = (uint8_t*)ws_grow((size_t)tstep * height + 1024);
+            gauss15_fused(d_src, srcStep, tmp, tstep, width, height, TH, 64, stream);
+            int th = ((width + 15) / 16 + 31) / 32 * 32;
+            if (th > 256) th = 256;
+            if (th < 32)  th = 32;
+            dim3 gc(idiv_up(width, 16 * th), height);
+            g5_copy16_kernel<<<gc, th, 0, stream>>>(tmp, tstep, d_dst, dstStep, width);
+            return;
+        }
+    }
 
     // v4 路径（spike 002）：OpenCV 同构 4-patch halo 布局，全尺寸实测最快
     {
