@@ -555,45 +555,99 @@ void gpu_mean(const uint8_t* d_src, size_t srcStep, uint8_t* d_dst, size_t dstSt
 // 与 OpenCV boxFilter(CV_32FC1) 的 float 累加同序，逐位一致（smoke 容差 1e-2 兜底）。
 namespace {
 
-__global__ void mean32_rows_kernel(const float* __restrict__ src, size_t sstep,
-                                   float* __restrict__ tmp, size_t tstep,
-                                   int W, int k)
+// （旧的 mean32_rows_kernel：每 block 一行 256 列段 + 512 元 Hillis-Steele 扫描。
+//   r68 起已被 mean32_rows_slide_kernel 完全替掉，探针 probe_mr32 里保留了同名副本做 A/B。）
+
+// ---------------- f32 大核行遍重写（2026-11-28 r68）----------------
+// 归因（probe_mr32 sweep，交错 min）：r66 只换了列遍，行遍仍是老的「每 block 一行 256 列段
+//   + 512 元 Hillis-Steele 扫描」；r67b bench 反推 mean-f32 4K k=31 总 4.6459ms、列遍 vec 0.912
+//   ⇒ 行遍 ≈ 3.73ms。行遍流量只有 8B/px（读 4 + 写 4 = 33.2MB@4K），地板 93 GB/s ⇒ 0.36ms，
+//   即 k=31 有 10 倍空间。u8 侧 r64 早已修过同一结构（f32 侧漏了）。
+// 定案 mean32_rows_slide_kernel<C=8>：照抄 u8 mean_rows_slide_kernel 的结构 ——
+//   ① **一行一个 block**（4K 2160 块，旧路径 15×2160 个块）；
+//   ② 整段 [x0-half, x0+bw+half) 一次搬进 smem，REFLECT_101 在载入时解决；
+//   ③ 每线程 C 个连续像素，初始窗口 O(k) 直加一次，之后「+新 −旧」O(1)/像素；
+//   ④ 整块路径 float4 写（C=8 → 2 条），尾块标量。
+// C 扫参（probe_mr32 sweep）：**C=8 全尺寸最优**（C=4 略逊、C=16 反而慢 10~25%），
+//   与 u8 侧 C=16 的甜点不同 —— f32 每线程字节数翻倍，C 减半才是同一物理造型。
+// 实测（probe_mr32 sweep，纯内核交错 min）：
+//   4K k=15 1.4367→0.7455（1.93x, 66.5→126 GB/s@8B）、k=31 3.5461→0.7567（4.69x, 87.7 GB/s）；
+//   1080p k=15 0.4229→0.2038、k=31 0.9953→0.2109；720p k=15 0.1935→0.1065、k=31 0.5069→0.1157；
+//   640 k=15 0.0758→0.0410、k=31 0.1792→0.0451。
+// 验证：probe_mr32 check **44 用例**（22 形状 × k=15/31）vs CPU double 精确窗口和
+//   **newMaxDiff=0 全 0**（旧内核在 W<k 的 7x1/15x1/16x1/17x3/7x400 反而有 6e3 量级误差，
+//   那是旧扫描在窄图上的既有角落，非本轮引入；新内核靠镜像天然正确）。
+// 算术次序与旧内核不同（滑动 vs 重算）→ float 结合律差 ~1e-5，smoke 容差 1e-2 不受影响。
+// 约束：无（任意宽度/任意 kh 都走本内核；只要求 tmp 行距按 W*4 分配，调用方已保证）。
+template <int C>
+__global__ void mean32_rows_slide_kernel(const float* __restrict__ src, size_t sstep,
+                                         float* __restrict__ tmp, size_t tstep, int W, int k,
+                                         bool vecst)
 {
-    __shared__ float sp[MF_PAD];
-    const int y   = blockIdx.y;
-    const int x0  = blockIdx.x * MF_THREADS;
+    extern __shared__ float sm32[];
     const int half = k >> 1;
-    const int tid = threadIdx.x;
-    const int N   = MF_THREADS + k - 1;
+    const int y    = blockIdx.x;
+    const int bw   = blockDim.x * C;
+    const int x0   = blockIdx.y * bw;
+    const int tid  = threadIdx.x;
+    const int nld  = min(bw, W - x0) + 2 * half;
     const float* srow = src + (size_t)y * (sstep >> 2);
 
-    for (int i = tid; i < N; i += MF_THREADS)
-        sp[i] = srow[mirror101<true>(x0 - half + i, W)];
-    for (int i = N + tid; i < MF_PAD; i += MF_THREADS) sp[i] = 0.f;
+    for (int i = tid; i < nld; i += blockDim.x)
+        sm32[i] = srow[mirror101<true>(x0 - half + i, W)];
     __syncthreads();
 
-    const int x = x0 + tid;
-    if (x >= W) return;
-    float sum;
-    if (k <= 15) {
-        sum = 0.f;
+    const int gx = x0 + tid * C;
+    if (gx >= W) return;
+    const int li = tid * C;
+    float* trow = tmp + (size_t)y * (tstep >> 2);
+
+    if (gx + C <= W) {
+        float s = 0.f;
 #pragma unroll 4
-        for (int j = 0; j < k; ++j) sum += sp[tid + j];
-    } else {
-        // 大核：Hillis-Steele inclusive scan（每线程负责相邻 2 元），P[i]=Σ_{j<=i} sp[j]
-        for (int d = 1; d < MF_PAD; d <<= 1) {
-            const int i0 = 2 * tid, i1 = 2 * tid + 1;
-            float a = 0.f, b = 0.f;
-            if (i0 >= d) a = sp[i0 - d];
-            if (i1 >= d) b = sp[i1 - d];
-            __syncthreads();
-            if (i0 >= d) sp[i0] += a;
-            if (i1 >= d) sp[i1] += b;
-            __syncthreads();
+        for (int j = 0; j < k; ++j) s += sm32[li + j];
+        float p[C];
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+            p[i] = s;
+            s += sm32[li + i + k] - sm32[li + i];
         }
-        sum = sp[tid + k - 1] - (tid ? sp[tid - 1] : 0.f);
+        if (vecst && (C % 4 == 0)) {
+            float4* q = (float4*)(trow + gx);
+#pragma unroll
+            for (int i = 0; i < C / 4; ++i)
+                q[i] = make_float4(p[4*i], p[4*i+1], p[4*i+2], p[4*i+3]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < C; ++i) trow[gx + i] = p[i];
+        }
+    } else {
+        const int n = W - gx;
+        float s = 0.f;
+#pragma unroll 4
+        for (int j = 0; j < k; ++j) s += sm32[li + j];
+        for (int i = 0; i < n; ++i) {
+            trow[gx + i] = s;
+            if (i + 1 < n) s += sm32[li + i + k] - sm32[li + i];
+        }
     }
-    tmp[(size_t)y * (tstep >> 2) + x] = sum;
+}
+
+// f32 行遍分派：一行一 block，th 按 W 选（每线程 8 像素）
+void mean32_rows_slide(const float* d_src, size_t srcStep, float* tmp, size_t tstep,
+                       int width, int height, int k, cudaStream_t stream)
+{
+    constexpr int C = 8;
+    int th = (width + C - 1) / C;
+    th = (th + 31) / 32 * 32;
+    if (th > 256) th = 256;
+    if (th < 32)  th = 32;
+    const int bw   = th * C;
+    const int nbx  = (width + bw - 1) / bw;
+    const size_t smem = (size_t)(bw + 2 * (k / 2)) * sizeof(float);
+    dim3 g(height, nbx);
+    const bool vecst = (((tstep & 15) == 0) && (((size_t)tmp & 15) == 0));
+    mean32_rows_slide_kernel<C><<<g, th, smem, stream>>>(d_src, srcStep, tmp, tstep, width, k, vecst);
 }
 
 __global__ void mean32_cols_blocked_kernel(const float* __restrict__ tmp, size_t tstep,
@@ -856,8 +910,9 @@ void gpu_mean_f32(const float* d_src, size_t srcStep, float* d_dst, size_t dstSt
     const size_t tstep = (size_t)width * 4;
     float* tmp = (float*)ws_grow(tstep * height + 1024);
 
-    dim3 g1(idiv_up(width, MF_THREADS), height), t1(MF_THREADS);
-    mean32_rows_kernel<<<g1, t1, 0, stream>>>(d_src, srcStep, tmp, tstep, width, kw);
+    // 行遍（2026-11-28 r68 重写）：一行一 block + 每线程 8 像素滑动，替掉旧的
+    // 「一行 256 列段 + 512 元 Hillis-Steele 扫描」。4K k=31 3.55→0.76ms（4.7x）。
+    mean32_rows_slide(d_src, srcStep, tmp, tstep, width, height, kw, stream);
 
     // 列遍（2026-11-25 r66 重写）：对齐且 W%4==0 走 vec 版（4 列/线程 + 行分块 + 滑动），
     // 实测 4K k=15 1.072→0.790ms、k=31 1.050→0.912；否则回退旧路径。
